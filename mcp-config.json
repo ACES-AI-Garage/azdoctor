@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "azdoctor": {
+      "type": "local",
       "command": "node",
       "args": ["./server/build/index.js"]
     }
