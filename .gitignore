@@ -1,5 +1,4 @@
 node_modules/
-server/build/
 server/*.tsbuildinfo
 .env
 *.log
