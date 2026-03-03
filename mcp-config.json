@@ -3,7 +3,8 @@
     "azdoctor": {
       "type": "local",
       "command": "node",
-      "args": ["./server/build/index.js"]
+      "args": ["./server/build/index.js"],
+      "cwd": "."
     }
   }
 }

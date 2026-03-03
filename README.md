@@ -73,11 +73,26 @@ No single existing tool combines all three. AZ Doctor is the orchestration layer
 
 ### As a Copilot CLI Plugin
 
+1. In Copilot CLI:
 ```
 /plugin install ACES-AI-Garage/azdoctor
 ```
 
-### Build the MCP Server
+2. Install server dependencies (one-time setup):
+```powershell
+# PowerShell (Windows)
+cd "$env:USERPROFILE\.copilot\installed-plugins\_direct\ACES-AI-Garage--azdoctor\server"
+npm install --omit=dev
+```
+```bash
+# macOS/Linux
+cd ~/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor/server
+npm install --omit=dev
+```
+
+3. Restart Copilot CLI. Run `/mcp show azdoctor` to confirm the server is connected.
+
+### Local Development
 
 ```bash
 cd server
