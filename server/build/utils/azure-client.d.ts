@@ -8,6 +8,13 @@ import { LogsQueryClient, MetricsQueryClient } from "@azure/monitor-query";
 import type { MetricsQueryResult } from "@azure/monitor-query";
 import { MicrosoftSupport } from "@azure/arm-support";
 export declare function getCredential(): TokenCredential;
+/**
+ * Resolve the Azure subscription ID from multiple sources:
+ * 1. Explicit parameter (if provided)
+ * 2. AZURE_SUBSCRIPTION_ID environment variable
+ * 3. Default subscription from `az account show`
+ */
+export declare function resolveSubscription(explicit?: string): Promise<string>;
 export interface AzureError {
     code: string;
     message: string;

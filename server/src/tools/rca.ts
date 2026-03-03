@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
+  resolveSubscription,
   queryResourceGraph,
   getResourceHealth,
   getActivityLogs,
@@ -36,7 +37,7 @@ export function registerRca(server: McpServer): void {
     "Generate a structured Root Cause Analysis document from investigation results. Produces markdown suitable for ServiceNow, post-incident reviews, or export.",
     {
       resource: z.string().describe("Resource name or full Azure resource ID"),
-      subscription: z.string().describe("Azure subscription ID"),
+      subscription: z.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
       incidentStart: z
         .string()
         .optional()
@@ -52,11 +53,12 @@ export function registerRca(server: McpServer): void {
     },
     async ({
       resource,
-      subscription,
+      subscription: subParam,
       incidentStart,
       incidentEnd,
       includeRecommendations,
     }) => {
+      const subscription = await resolveSubscription(subParam);
       const errors: AzureError[] = [];
       const allEvents: DiagnosticEvent[] = [];
 

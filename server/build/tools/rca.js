@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { queryResourceGraph, getResourceHealth, getActivityLogs, getMetrics, } from "../utils/azure-client.js";
+import { resolveSubscription, queryResourceGraph, getResourceHealth, getActivityLogs, getMetrics, } from "../utils/azure-client.js";
 import { correlateTimelines, detectMetricAnomalies } from "../utils/correlator.js";
 import { formatRCA } from "../utils/formatters.js";
 /** Same metric map as investigate — shared knowledge of common metrics per resource type */
@@ -23,7 +23,7 @@ const METRIC_MAP = {
 export function registerRca(server) {
     server.tool("azdoctor_rca", "Generate a structured Root Cause Analysis document from investigation results. Produces markdown suitable for ServiceNow, post-incident reviews, or export.", {
         resource: z.string().describe("Resource name or full Azure resource ID"),
-        subscription: z.string().describe("Azure subscription ID"),
+        subscription: z.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
         incidentStart: z
             .string()
             .optional()
@@ -36,7 +36,8 @@ export function registerRca(server) {
             .boolean()
             .default(true)
             .describe("Whether to include follow-up recommendations"),
-    }, async ({ resource, subscription, incidentStart, incidentEnd, includeRecommendations, }) => {
+    }, async ({ resource, subscription: subParam, incidentStart, incidentEnd, includeRecommendations, }) => {
+        const subscription = await resolveSubscription(subParam);
         const errors = [];
         const allEvents = [];
         // Determine investigation window from incident times or default to 24h

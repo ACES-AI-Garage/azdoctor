@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { queryResourceGraph, getResourceHealth, getActivityLogs, getMetrics, } from "../utils/azure-client.js";
+import { resolveSubscription, queryResourceGraph, getResourceHealth, getActivityLogs, getMetrics, } from "../utils/azure-client.js";
 import { correlateTimelines, detectMetricAnomalies, } from "../utils/correlator.js";
 /** Common metric names by resource type for automatic querying */
 const METRIC_MAP = {
@@ -39,7 +39,7 @@ export function registerInvestigate(server) {
         resource: z
             .string()
             .describe("Resource name or full Azure resource ID"),
-        subscription: z.string().describe("Azure subscription ID"),
+        subscription: z.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
         resourceGroup: z
             .string()
             .optional()
@@ -52,7 +52,8 @@ export function registerInvestigate(server) {
             .string()
             .optional()
             .describe('User-described symptom (e.g., "slow", "500 errors", "unreachable")'),
-    }, async ({ resource, subscription, resourceGroup, timeframeHours, symptom, }) => {
+    }, async ({ resource, subscription: subParam, resourceGroup, timeframeHours, symptom, }) => {
+        const subscription = await resolveSubscription(subParam);
         const errors = [];
         const allEvents = [];
         // 1. Resolve resource ID from name if needed

@@ -1,8 +1,9 @@
 import { z } from "zod";
+import { resolveSubscription } from "../utils/azure-client.js";
 export function registerDraftTicket(server) {
     server.tool("azdoctor_draft_ticket", "Pre-populate a support ticket with diagnostic context from a prior investigation. Creates via Support API if accessible, otherwise generates a formatted draft for copy-paste.", {
         resource: z.string().describe("Resource name or full Azure resource ID"),
-        subscription: z.string().describe("Azure subscription ID"),
+        subscription: z.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
         investigationSummary: z
             .string()
             .describe("Output from azdoctor_investigate to include as context"),
@@ -10,7 +11,8 @@ export function registerDraftTicket(server) {
             .enum(["A", "B", "C"])
             .optional()
             .describe("Support ticket severity (A = critical, B = moderate, C = minimal)"),
-    }, async ({ resource, subscription, investigationSummary, severity }) => {
+    }, async ({ resource, subscription: subParam, investigationSummary, severity }) => {
+        const subscription = await resolveSubscription(subParam);
         // TODO: Implement ticket drafting
         // 1. Check Support API access (requires Support Request Contributor + paid plan)
         // 2. If accessible: create ticket via REST API with diagnostic context

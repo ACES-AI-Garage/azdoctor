@@ -1,8 +1,8 @@
 import { z } from "zod";
-import { queryResourceGraph, batchResourceHealth, getActivityLogs, } from "../utils/azure-client.js";
+import { resolveSubscription, queryResourceGraph, batchResourceHealth, getActivityLogs, } from "../utils/azure-client.js";
 export function registerHealthcheck(server) {
     server.tool("azdoctor_healthcheck", "Scan a subscription or resource group for health issues, anomalies, and risks. Returns a risk-scored summary of findings across all resources.", {
-        subscription: z.string().describe("Azure subscription ID"),
+        subscription: z.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
         resourceGroup: z
             .string()
             .optional()
@@ -11,7 +11,8 @@ export function registerHealthcheck(server) {
             .enum(["critical", "warning", "info"])
             .default("warning")
             .describe("Minimum severity threshold for reported findings"),
-    }, async ({ subscription, resourceGroup, severity }) => {
+    }, async ({ subscription: subParam, resourceGroup, severity }) => {
+        const subscription = await resolveSubscription(subParam);
         const findings = [];
         const errors = [];
         // 1. Query Resource Graph for all resources in scope

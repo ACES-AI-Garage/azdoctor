@@ -8,6 +8,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 // src/utils/azure-client.ts
+import { execSync } from "node:child_process";
 import { DefaultAzureCredential } from "@azure/identity";
 import {
   ResourceGraphClient
@@ -22,6 +23,31 @@ function getCredential() {
     credentialInstance = new DefaultAzureCredential();
   }
   return credentialInstance;
+}
+var cachedSubscription = null;
+async function resolveSubscription(explicit) {
+  if (explicit) return explicit;
+  if (cachedSubscription) return cachedSubscription;
+  const envSub = process.env.AZURE_SUBSCRIPTION_ID;
+  if (envSub) {
+    cachedSubscription = envSub;
+    return envSub;
+  }
+  try {
+    const output = execSync("az account show --query id -o tsv", {
+      encoding: "utf-8",
+      timeout: 1e4,
+      stdio: ["pipe", "pipe", "pipe"]
+    }).trim();
+    if (output) {
+      cachedSubscription = output;
+      return output;
+    }
+  } catch {
+  }
+  throw new Error(
+    "No subscription ID found. Provide one explicitly, set AZURE_SUBSCRIPTION_ID, or run 'az login'."
+  );
 }
 function classifyError(err, context) {
   const e = err;
@@ -168,11 +194,12 @@ function registerHealthcheck(server2) {
     "azdoctor_healthcheck",
     "Scan a subscription or resource group for health issues, anomalies, and risks. Returns a risk-scored summary of findings across all resources.",
     {
-      subscription: z.string().describe("Azure subscription ID"),
+      subscription: z.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
       resourceGroup: z.string().optional().describe("Scope to a specific resource group"),
       severity: z.enum(["critical", "warning", "info"]).default("warning").describe("Minimum severity threshold for reported findings")
     },
-    async ({ subscription, resourceGroup, severity }) => {
+    async ({ subscription: subParam, resourceGroup, severity }) => {
+      const subscription = await resolveSubscription(subParam);
       const findings = [];
       const errors = [];
       const rgQuery = resourceGroup ? `Resources | where resourceGroup =~ '${resourceGroup}' | project id, name, type, location, resourceGroup` : `Resources | project id, name, type, location, resourceGroup`;
@@ -445,7 +472,7 @@ function registerInvestigate(server2) {
     "Investigate a specific Azure resource or incident. Performs multi-signal correlation across Resource Health, Activity Logs, Metrics, and dependent resources to identify root cause.",
     {
       resource: z2.string().describe("Resource name or full Azure resource ID"),
-      subscription: z2.string().describe("Azure subscription ID"),
+      subscription: z2.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
       resourceGroup: z2.string().optional().describe("Resource group name (helps resolve resource ID faster)"),
       timeframeHours: z2.number().default(24).describe("How many hours back to investigate"),
       symptom: z2.string().optional().describe(
@@ -454,11 +481,12 @@ function registerInvestigate(server2) {
     },
     async ({
       resource,
-      subscription,
+      subscription: subParam,
       resourceGroup,
       timeframeHours,
       symptom
     }) => {
+      const subscription = await resolveSubscription(subParam);
       const errors = [];
       const allEvents = [];
       let resourceId = resource;
@@ -723,18 +751,19 @@ function registerRca(server2) {
     "Generate a structured Root Cause Analysis document from investigation results. Produces markdown suitable for ServiceNow, post-incident reviews, or export.",
     {
       resource: z3.string().describe("Resource name or full Azure resource ID"),
-      subscription: z3.string().describe("Azure subscription ID"),
+      subscription: z3.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
       incidentStart: z3.string().optional().describe("ISO timestamp for incident start"),
       incidentEnd: z3.string().optional().describe("ISO timestamp for incident resolution"),
       includeRecommendations: z3.boolean().default(true).describe("Whether to include follow-up recommendations")
     },
     async ({
       resource,
-      subscription,
+      subscription: subParam,
       incidentStart,
       incidentEnd,
       includeRecommendations
     }) => {
+      const subscription = await resolveSubscription(subParam);
       const errors = [];
       const allEvents = [];
       const now = /* @__PURE__ */ new Date();
@@ -895,9 +924,10 @@ function registerCheckPermissions(server2) {
     "azdoctor_check_permissions",
     "Detect what diagnostic data the current credentials can access and recommend role upgrades for fuller diagnostics.",
     {
-      subscription: z4.string().describe("Azure subscription ID")
+      subscription: z4.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)")
     },
-    async ({ subscription }) => {
+    async ({ subscription: subParam }) => {
+      const subscription = await resolveSubscription(subParam);
       const stubResponse = {
         subscription,
         checks: {
@@ -932,11 +962,12 @@ function registerDraftTicket(server2) {
     "Pre-populate a support ticket with diagnostic context from a prior investigation. Creates via Support API if accessible, otherwise generates a formatted draft for copy-paste.",
     {
       resource: z5.string().describe("Resource name or full Azure resource ID"),
-      subscription: z5.string().describe("Azure subscription ID"),
+      subscription: z5.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
       investigationSummary: z5.string().describe("Output from azdoctor_investigate to include as context"),
       severity: z5.enum(["A", "B", "C"]).optional().describe("Support ticket severity (A = critical, B = moderate, C = minimal)")
     },
-    async ({ resource, subscription, investigationSummary, severity }) => {
+    async ({ resource, subscription: subParam, investigationSummary, severity }) => {
+      const subscription = await resolveSubscription(subParam);
       const stubResponse = {
         ticketDraft: {
           title: `Diagnostic Investigation: ${resource}`,

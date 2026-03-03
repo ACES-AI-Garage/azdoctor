@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
+  resolveSubscription,
   queryResourceGraph,
   getResourceHealth,
   getActivityLogs,
@@ -62,7 +63,7 @@ export function registerInvestigate(server: McpServer): void {
       resource: z
         .string()
         .describe("Resource name or full Azure resource ID"),
-      subscription: z.string().describe("Azure subscription ID"),
+      subscription: z.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
       resourceGroup: z
         .string()
         .optional()
@@ -80,11 +81,12 @@ export function registerInvestigate(server: McpServer): void {
     },
     async ({
       resource,
-      subscription,
+      subscription: subParam,
       resourceGroup,
       timeframeHours,
       symptom,
     }) => {
+      const subscription = await resolveSubscription(subParam);
       const errors: AzureError[] = [];
       const allEvents: DiagnosticEvent[] = [];
 

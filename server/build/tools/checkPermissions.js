@@ -1,8 +1,10 @@
 import { z } from "zod";
+import { resolveSubscription } from "../utils/azure-client.js";
 export function registerCheckPermissions(server) {
     server.tool("azdoctor_check_permissions", "Detect what diagnostic data the current credentials can access and recommend role upgrades for fuller diagnostics.", {
-        subscription: z.string().describe("Azure subscription ID"),
-    }, async ({ subscription }) => {
+        subscription: z.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
+    }, async ({ subscription: subParam }) => {
+        const subscription = await resolveSubscription(subParam);
         // TODO: Implement permission checks
         // 1. Try Resource Health API → catch 403
         // 2. Try Activity Log API → catch 403

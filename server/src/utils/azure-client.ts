@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import { DefaultAzureCredential } from "@azure/identity";
 import type { TokenCredential } from "@azure/identity";
 import {
@@ -21,6 +22,50 @@ export function getCredential(): TokenCredential {
     credentialInstance = new DefaultAzureCredential();
   }
   return credentialInstance;
+}
+
+// ─── Subscription resolution ─────────────────────────────────────────
+
+let cachedSubscription: string | null = null;
+
+/**
+ * Resolve the Azure subscription ID from multiple sources:
+ * 1. Explicit parameter (if provided)
+ * 2. AZURE_SUBSCRIPTION_ID environment variable
+ * 3. Default subscription from `az account show`
+ */
+export async function resolveSubscription(
+  explicit?: string
+): Promise<string> {
+  if (explicit) return explicit;
+
+  if (cachedSubscription) return cachedSubscription;
+
+  // Check env var
+  const envSub = process.env.AZURE_SUBSCRIPTION_ID;
+  if (envSub) {
+    cachedSubscription = envSub;
+    return envSub;
+  }
+
+  // Fall back to az CLI default subscription
+  try {
+    const output = execSync("az account show --query id -o tsv", {
+      encoding: "utf-8",
+      timeout: 10000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    if (output) {
+      cachedSubscription = output;
+      return output;
+    }
+  } catch {
+    // az CLI not available or not logged in
+  }
+
+  throw new Error(
+    "No subscription ID found. Provide one explicitly, set AZURE_SUBSCRIPTION_ID, or run 'az login'."
+  );
 }
 
 // ─── Error handling ──────────────────────────────────────────────────

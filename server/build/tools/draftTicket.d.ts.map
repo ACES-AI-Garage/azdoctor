@@ -1,1 +1,1 @@
-{"version":3,"file":"draftTicket.d.ts","sourceRoot":"","sources":["../../src/tools/draftTicket.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,SAAS,EAAE,MAAM,yCAAyC,CAAC;AAGpE,wBAAgB,mBAAmB,CAAC,MAAM,EAAE,SAAS,GAAG,IAAI,CA+C3D"}
+{"version":3,"file":"draftTicket.d.ts","sourceRoot":"","sources":["../../src/tools/draftTicket.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,SAAS,EAAE,MAAM,yCAAyC,CAAC;AAIpE,wBAAgB,mBAAmB,CAAC,MAAM,EAAE,SAAS,GAAG,IAAI,CAgD3D"}
