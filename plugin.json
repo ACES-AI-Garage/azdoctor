@@ -1,0 +1,11 @@
+{
+  "name": "azdoctor",
+  "description": "AI-powered Azure diagnostics — multi-signal correlation, RCA generation, and proactive risk scoring",
+  "version": "0.1.0",
+  "author": { "name": "AZ Doctor Team" },
+  "license": "MIT",
+  "keywords": ["azure", "diagnostics", "troubleshooting", "support", "rca"],
+  "agents": "agents/",
+  "skills": ["skills/"],
+  "mcpServers": "mcp-config.json"
+}
