@@ -1,22 +1,8 @@
 {
   "mcpServers": {
-    "azure-mcp": {
-      "type": "local",
-      "command": "npx",
-      "args": ["-y", "@azure/mcp@latest", "server", "start"]
-    },
-    "microsoft-docs": {
-      "type": "http",
-      "url": "https://learn.microsoft.com/api/mcp",
-      "tools": ["*"]
-    },
     "azdoctor": {
-      "type": "local",
       "command": "node",
-      "args": ["./server/build/index.js"],
-      "env": {
-        "AZURE_SUBSCRIPTION_ID": "${AZURE_SUBSCRIPTION_ID}"
-      }
+      "args": ["./server/build/index.js"]
     }
   }
 }
