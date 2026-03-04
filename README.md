@@ -2,7 +2,7 @@
 
 **AI-powered Azure diagnostics for GitHub Copilot CLI.**
 
-Multi-signal correlation, root cause analysis, and proactive risk scoring — delivered as a Copilot CLI plugin backed by three MCP servers.
+Multi-signal correlation, root cause analysis, and proactive risk scoring — delivered as a Copilot CLI plugin backed by an MCP server.
 
 ## The Idea
 
@@ -33,7 +33,7 @@ No single existing tool combines all three. AZ Doctor is the orchestration layer
 │  ├─ plugin.json        Plugin manifest                         │
 │  ├─ agents/            Diagnostic agent instructions           │
 │  ├─ skills/            Workflow templates                      │
-│  └─ mcp-config.json    Wires up all 3 MCP servers             │
+│  └─ mcp-config.json    Wires up the MCP server                │
 ├────────────────────────────────────────────────────────────────┤
 │                    MCP SERVER LAYER                             │
 │                                                                │
@@ -63,58 +63,78 @@ No single existing tool combines all three. AZ Doctor is the orchestration layer
 | `azdoctor_check_permissions` | Detect credential access gaps and recommend role upgrades |
 | `azdoctor_draft_ticket` | Pre-populate support tickets with diagnostic context |
 
+All tools auto-detect your Azure subscription from `az CLI` — no need to pass a subscription ID.
+
 ## Install
 
 ### Prerequisites
 
-- [GitHub Copilot CLI](https://docs.github.com/en/copilot) installed
-- Azure CLI logged in (`az login`)
+- [GitHub Copilot CLI](https://docs.github.com/en/copilot) installed and working (`copilot` command in your terminal)
+- Azure CLI installed and logged in (`az login`)
 - Node.js 18+
 
-### As a Copilot CLI Plugin
+### Step 1: Install the plugin
 
-1. In Copilot CLI:
+In Copilot CLI, run:
+
 ```
 /plugin install ACES-AI-Garage/azdoctor
 ```
 
-2. Install server dependencies (one-time setup):
+### Step 2: Install server dependencies
+
+The MCP server needs its npm dependencies. Run this once after installing the plugin:
+
+**Windows (PowerShell):**
 ```powershell
-# PowerShell (Windows)
 cd "$env:USERPROFILE\.copilot\installed-plugins\_direct\ACES-AI-Garage--azdoctor\server"
 npm install --omit=dev
 ```
+
+**macOS / Linux:**
 ```bash
-# macOS/Linux
 cd ~/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor/server
 npm install --omit=dev
 ```
 
-3. Restart Copilot CLI. Run `/mcp show azdoctor` to confirm the server is connected.
+### Step 3: Restart and verify
 
-### Local Development
+Restart Copilot CLI, then run:
 
-```bash
-cd server
-npm install
-npm run build
+```
+/mcp show azdoctor
 ```
 
-### Verify
+You should see the `azdoctor` server listed with 5 tools. If it shows "not found", close Copilot CLI completely and reopen it.
 
-```bash
+### Updating
+
+To pull the latest version:
+
+**Windows (PowerShell):**
+```powershell
+cd "$env:USERPROFILE\.copilot\installed-plugins\_direct\ACES-AI-Garage--azdoctor"
+git pull
 cd server
-npx @modelcontextprotocol/inspector node build/index.js
+npm install --omit=dev
 ```
 
-All 5 tools should appear and respond in the inspector.
+**macOS / Linux:**
+```bash
+cd ~/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor
+git pull
+cd server
+npm install --omit=dev
+```
+
+Then restart Copilot CLI.
 
 ## Usage
 
 Once installed, use the `@azure-diagnostics` agent in Copilot CLI:
 
 ```
-@azure-diagnostics Check the health of my production subscription
+@azure-diagnostics Check the health of my subscription
 ```
 
 ```
@@ -122,7 +142,19 @@ Once installed, use the `@azure-diagnostics` agent in Copilot CLI:
 ```
 
 ```
+@azure-diagnostics Investigate sqlserver-nexus-corbin in resource group Nexus-Corbin
+```
+
+```
 @azure-diagnostics Generate an RCA for the outage on prod-api between 2pm and 4pm UTC today
+```
+
+You can also use the skills directly:
+
+```
+/diagnose — Investigate a specific Azure resource issue
+/healthcheck — Scan your subscription for health issues and risks
+/rca — Generate a structured Root Cause Analysis report
 ```
 
 ## Three-Layer Knowledge Strategy
@@ -139,9 +171,26 @@ As AZ Doctor matures, services graduate from Layer 2 to Layer 1 by adding dedica
 
 ## Auth
 
-All Azure API calls use `DefaultAzureCredential` from `@azure/identity`. For local development, run `az login` first — the MCP server inherits your CLI session automatically.
+All Azure API calls use `DefaultAzureCredential` from `@azure/identity`. Run `az login` before starting Copilot CLI — the MCP server inherits your CLI session automatically. No additional auth setup needed.
 
-Minimum role: **Reader** on the target subscription covers Resource Health, Activity Logs, Resource Graph, and Metrics. Log Analytics may require **Log Analytics Reader**. Support ticket creation requires **Support Request Contributor** and a paid support plan.
+**Minimum role:** Reader on the target subscription covers Resource Health, Activity Logs, Resource Graph, and Metrics. Log Analytics may require Log Analytics Reader. Support ticket creation requires Support Request Contributor and a paid support plan.
+
+## Local Development
+
+```bash
+cd server
+npm install
+npm run build
+```
+
+Test with MCP Inspector:
+
+```bash
+cd server
+npx @modelcontextprotocol/inspector node build/index.js
+```
+
+All 5 tools should appear and respond in the inspector.
 
 ## License
 
