@@ -171,10 +171,31 @@ export interface ResourceGraphResult {
   error?: AzureError;
 }
 
+const resourceGraphCache = new Map<
+  string,
+  { result: ResourceGraphResult; expiry: number }
+>();
+
+const RESOURCE_GRAPH_CACHE_TTL_MS = 60_000; // 60 seconds
+
+export function clearResourceGraphCache(): void {
+  resourceGraphCache.clear();
+}
+
 export async function queryResourceGraph(
   subscriptions: string[],
-  query: string
+  query: string,
+  skipCache: boolean = false
 ): Promise<ResourceGraphResult> {
+  const cacheKey = JSON.stringify({ subscriptions, query });
+
+  if (!skipCache) {
+    const cached = resourceGraphCache.get(cacheKey);
+    if (cached && cached.expiry > Date.now()) {
+      return cached.result;
+    }
+  }
+
   try {
     const client = createResourceGraphClient();
     const request: ResourceGraphModels.QueryRequest = {
@@ -183,10 +204,82 @@ export async function queryResourceGraph(
       options: { resultFormat: "objectArray" },
     };
     const response = await withRetry(() => client.resources(request));
-    const data = (response.data as Record<string, unknown>[]) ?? [];
-    return { resources: data, totalRecords: response.totalRecords ?? data.length };
+    const allData = (response.data as Record<string, unknown>[]) ?? [];
+    const totalRecords = response.totalRecords ?? allData.length;
+
+    // Paginate if there are more results (safety limit: 10 pages)
+    const MAX_PAGES = 10;
+    let skipToken = response.skipToken;
+    let page = 1;
+    while (skipToken && page < MAX_PAGES) {
+      const pagedRequest: ResourceGraphModels.QueryRequest = {
+        subscriptions,
+        query,
+        options: { resultFormat: "objectArray", skipToken },
+      };
+      const pagedResponse = await withRetry(() =>
+        client.resources(pagedRequest)
+      );
+      const pageData =
+        (pagedResponse.data as Record<string, unknown>[]) ?? [];
+      allData.push(...pageData);
+      skipToken = pagedResponse.skipToken;
+      page++;
+    }
+
+    const result: ResourceGraphResult = {
+      resources: allData,
+      totalRecords,
+    };
+
+    resourceGraphCache.set(cacheKey, {
+      result,
+      expiry: Date.now() + RESOURCE_GRAPH_CACHE_TTL_MS,
+    });
+
+    return result;
   } catch (err) {
     return { resources: [], totalRecords: 0, error: classifyError(err, "resourceGraph") };
+  }
+}
+
+// ─── Diagnostic Settings Discovery ──────────────────────────────────
+
+export interface DiagnosticSettingInfo {
+  name: string;
+  workspaceId: string;      // The workspace resource ID
+  workspaceCustomerId?: string; // The workspace GUID (for queries)
+  logs: string[];           // Which log categories are enabled
+  metrics: boolean;         // Whether metrics are sent
+}
+
+export async function getResourceDiagnosticSettings(
+  subscriptionId: string,
+  resourceUri: string
+): Promise<{ settings: DiagnosticSettingInfo[]; error?: AzureError }> {
+  try {
+    const client = createMonitorClient(subscriptionId);
+    const response = await withRetry(() =>
+      client.diagnosticSettings.list(resourceUri)
+    );
+
+    const settings: DiagnosticSettingInfo[] = (response.value ?? []).map(
+      (setting) => ({
+        name: setting.name ?? "",
+        workspaceId: setting.workspaceId ?? "",
+        // Note: The workspace GUID (customerId) cannot be obtained from diagnostic
+        // settings alone — it would require a separate call to the workspace resource.
+        workspaceCustomerId: undefined,
+        logs: (setting.logs ?? [])
+          .filter((log) => log.enabled)
+          .map((log) => log.category ?? ""),
+        metrics: (setting.metrics ?? []).some((m) => m.enabled),
+      })
+    );
+
+    return { settings };
+  } catch (err) {
+    return { settings: [], error: classifyError(err, "diagnosticSettings") };
   }
 }
 
@@ -244,7 +337,8 @@ export async function getActivityLogs(
   subscriptionId: string,
   hoursBack: number = 24,
   resourceUri?: string,
-  resourceGroup?: string
+  resourceGroup?: string,
+  maxEvents: number = 1000
 ): Promise<ActivityLogResult> {
   try {
     const client = createMonitorClient(subscriptionId);
@@ -261,6 +355,9 @@ export async function getActivityLogs(
     const events: EventData[] = [];
     for await (const event of client.activityLogs.list(filter)) {
       events.push(event);
+      if (events.length >= maxEvents) {
+        break;
+      }
     }
     return { events };
   } catch (err) {
@@ -340,4 +437,56 @@ export async function queryLogAnalytics(
   } catch (err) {
     return { tables: [], error: classifyError(err, "logAnalytics") };
   }
+}
+
+// ─── Log Analytics Workspace Discovery ──────────────────────────────
+
+export interface WorkspaceInfo {
+  workspaceId: string;
+  workspaceName: string;
+  resourceId: string;
+}
+
+export async function discoverWorkspaces(
+  subscriptionId: string,
+  resourceGroup?: string
+): Promise<{ workspaces: WorkspaceInfo[]; error?: AzureError }> {
+  let query =
+    "Resources | where type =~ 'Microsoft.OperationalInsights/workspaces' | project id, name, properties.customerId";
+
+  if (resourceGroup) {
+    query =
+      `Resources | where type =~ 'Microsoft.OperationalInsights/workspaces' | where resourceGroup =~ '${resourceGroup}' | project id, name, properties.customerId`;
+  }
+
+  const result = await queryResourceGraph([subscriptionId], query);
+
+  if (result.error) {
+    return { workspaces: [], error: result.error };
+  }
+
+  const workspaces: WorkspaceInfo[] = result.resources.map((r) => ({
+    workspaceId: (r["properties_customerId"] as string) ?? "",
+    workspaceName: (r["name"] as string) ?? "",
+    resourceId: (r["id"] as string) ?? "",
+  }));
+
+  return { workspaces };
+}
+
+// ─── Concurrency Limiter ────────────────────────────────────────────
+
+export async function batchExecute<T>(
+  tasks: (() => Promise<T>)[],
+  batchSize: number = 5
+): Promise<T[]> {
+  const results: T[] = [];
+
+  for (let i = 0; i < tasks.length; i += batchSize) {
+    const batch = tasks.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map((fn) => fn()));
+    results.push(...batchResults);
+  }
+
+  return results;
 }

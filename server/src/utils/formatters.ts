@@ -107,6 +107,406 @@ export function formatHealthSummary(
 ${rows}`;
 }
 
+export interface ErrorSummary {
+  totalErrors: number;
+  permissionGaps: Array<{ api: string; recommendation: string }>;
+  otherErrors: Array<{ api: string; message: string }>;
+  message: string;
+}
+
+/**
+ * Produce a structured error/permissions summary from a list of API errors.
+ */
+export function formatErrorSummary(
+  errors: Array<{ code: string; message: string; roleRecommendation?: string }>
+): ErrorSummary {
+  const permissionGaps: ErrorSummary["permissionGaps"] = [];
+  const otherErrors: ErrorSummary["otherErrors"] = [];
+
+  for (const err of errors) {
+    if (err.code === "FORBIDDEN") {
+      permissionGaps.push({
+        api: err.message,
+        recommendation: err.roleRecommendation ?? "Check required RBAC roles",
+      });
+    } else {
+      otherErrors.push({ api: err.code, message: err.message });
+    }
+  }
+
+  let message: string;
+  if (errors.length === 0) {
+    message = "All APIs accessible — full diagnostic data available.";
+  } else if (otherErrors.length === 0) {
+    message = `${permissionGaps.length} API(s) inaccessible due to permissions — results may be incomplete. Run azdoctor_check_permissions for details.`;
+  } else if (permissionGaps.length === 0) {
+    message = `${otherErrors.length} API call(s) failed — some diagnostic data may be missing.`;
+  } else {
+    message =
+      `${permissionGaps.length} API(s) inaccessible due to permissions — results may be incomplete. Run azdoctor_check_permissions for details. ` +
+      `${otherErrors.length} API call(s) failed — some diagnostic data may be missing.`;
+  }
+
+  return {
+    totalErrors: errors.length,
+    permissionGaps,
+    otherErrors,
+    message,
+  };
+}
+
+/**
+ * Format a comparison summary between two scopes as a markdown table.
+ */
+export function formatComparisonSummary(
+  scopeA: string,
+  scopeB: string,
+  differences: Array<{ category: string; detail: string; severity: string }>
+): string {
+  if (differences.length === 0) {
+    return `No differences found between **${scopeA}** and **${scopeB}**.`;
+  }
+
+  const rows = differences
+    .map(
+      (d) =>
+        `| ${severityIcon(d.severity)} ${d.severity.toUpperCase()} | ${d.category} | ${d.detail} |`
+    )
+    .join("\n");
+
+  return `### Comparison: ${scopeA} vs ${scopeB}
+
+| Severity | Category | Detail |
+|----------|----------|--------|
+${rows}
+
+_${differences.length} difference(s) found._`;
+}
+
+// ─── Topology Rendering ─────────────────────────────────────────────
+
+export interface TopologyNode {
+  name: string;
+  type: string;
+  health: "Available" | "Degraded" | "Unavailable" | "Unknown";
+  isRoot: boolean;
+}
+
+function healthTag(health: TopologyNode["health"]): string {
+  switch (health) {
+    case "Available":
+      return "[OK]";
+    case "Degraded":
+      return "[WARN]";
+    case "Unavailable":
+      return "[CRIT]";
+    case "Unknown":
+      return "[??]";
+  }
+}
+
+/**
+ * Render an ASCII dependency graph showing health at each node.
+ * Uses horizontal box layout for ≤4 dependencies, vertical list for >4.
+ */
+export function renderTopology(root: TopologyNode, dependencies: TopologyNode[]): string {
+  // Format the root node box
+  const rootLabel = `${root.name} (${root.type})`;
+  const rootTag = healthTag(root.health);
+  const rootContent = `  ${rootLabel}  ${rootTag}  `;
+  // Ensure minimum width but cap at ~70
+  const rootBoxWidth = Math.min(70, Math.max(30, rootContent.length + 2));
+  const paddedRootContent = rootContent.padEnd(rootBoxWidth - 2);
+
+  const rootTop = `┌${"─".repeat(rootBoxWidth - 2)}┐`;
+  const rootMid = `│${paddedRootContent}│`;
+  const rootBot = dependencies.length > 0
+    ? (() => {
+        const half = Math.floor((rootBoxWidth - 2) / 2);
+        return `└${"─".repeat(half)}┬${"─".repeat(rootBoxWidth - 3 - half)}┘`;
+      })()
+    : `└${"─".repeat(rootBoxWidth - 2)}┘`;
+
+  if (dependencies.length === 0) {
+    return [rootTop, rootMid, rootBot].join("\n");
+  }
+
+  // Calculate the center position of the connector (the ┬ character)
+  const connectorPos = Math.floor((rootBoxWidth - 2) / 2) + 1; // +1 for the leading └
+
+  if (dependencies.length > 4) {
+    // Vertical list layout
+    const lines: string[] = [rootTop, rootMid, rootBot];
+    const pad = " ".repeat(connectorPos);
+    lines.push(`${pad}│`);
+
+    for (let i = 0; i < dependencies.length; i++) {
+      const dep = dependencies[i];
+      const connector = i < dependencies.length - 1 ? "├" : "└";
+      const depLabel = `${dep.name} (${dep.type}) ${healthTag(dep.health)}`;
+      lines.push(`${pad}${connector}── ${depLabel}`);
+    }
+
+    return lines.join("\n");
+  }
+
+  // Horizontal box layout for ≤4 dependencies
+  // Build individual boxes for each dependency
+  const depBoxes: { top: string; mid1: string; mid2: string; bot: string; width: number }[] = [];
+
+  for (const dep of dependencies) {
+    const name = dep.name;
+    const tag = healthTag(dep.health);
+    const line1Width = name.length;
+    const line2Width = tag.length;
+    const innerWidth = Math.max(line1Width, line2Width) + 2; // 1 padding each side
+    const padName = name.padStart(Math.floor((innerWidth + name.length) / 2)).padEnd(innerWidth);
+    const padTag = tag.padStart(Math.floor((innerWidth + tag.length) / 2)).padEnd(innerWidth);
+
+    depBoxes.push({
+      top: `┌${"─".repeat(innerWidth)}┐`,
+      mid1: `│${padName}│`,
+      mid2: `│${padTag}│`,
+      bot: `└${"─".repeat(innerWidth)}┘`,
+      width: innerWidth + 2, // include borders
+    });
+  }
+
+  const gap = " ";
+  const totalWidth = depBoxes.reduce((s, b) => s + b.width, 0) + (depBoxes.length - 1) * gap.length;
+
+  // Connector line: from root center down, then horizontal branches to each box center
+  const boxCenters: number[] = [];
+  let offset = 0;
+  for (const box of depBoxes) {
+    boxCenters.push(offset + Math.floor(box.width / 2));
+    offset += box.width + gap.length;
+  }
+
+  // We need to align the root box center with the overall connector area
+  // Center the dependency row under the root box
+  const depRowOffset = Math.max(0, connectorPos - Math.floor(totalWidth / 2));
+  const adjustedCenters = boxCenters.map((c) => c + depRowOffset);
+
+  // Build the connector lines
+  // Line 1: vertical from root center
+  const vertLine = " ".repeat(connectorPos) + "│";
+
+  // Line 2: horizontal branch with vertical drops
+  const leftmost = adjustedCenters[0];
+  const rightmost = adjustedCenters[adjustedCenters.length - 1];
+  const branchWidth = rightmost - leftmost + 1;
+  const branchChars: string[] = new Array(rightmost + 1).fill(" ");
+
+  for (let i = leftmost; i <= rightmost; i++) {
+    branchChars[i] = "─";
+  }
+  // Place connectors at each box center
+  for (const c of adjustedCenters) {
+    branchChars[c] = "┼";
+  }
+  // If connector is in range, mark it
+  if (connectorPos >= leftmost && connectorPos <= rightmost) {
+    branchChars[connectorPos] = "┼";
+  }
+
+  const branchLine = branchChars.join("");
+
+  // Line 3: arrows pointing down
+  const arrowChars: string[] = new Array(rightmost + 1).fill(" ");
+  for (const c of adjustedCenters) {
+    arrowChars[c] = "▼";
+  }
+  const arrowLine = arrowChars.join("");
+
+  // Build the box rows with proper offset
+  const padLeft = " ".repeat(depRowOffset);
+  const boxTop = padLeft + depBoxes.map((b) => b.top).join(gap);
+  const boxMid1 = padLeft + depBoxes.map((b) => b.mid1).join(gap);
+  const boxMid2 = padLeft + depBoxes.map((b) => b.mid2).join(gap);
+  const boxBot = padLeft + depBoxes.map((b) => b.bot).join(gap);
+
+  return [
+    rootTop,
+    rootMid,
+    rootBot,
+    vertLine,
+    branchLine,
+    arrowLine,
+    boxTop,
+    boxMid1,
+    boxMid2,
+    boxBot,
+  ].join("\n");
+}
+
+// ─── Mermaid Diagram Rendering ──────────────────────────────────────
+
+function healthColor(health: TopologyNode["health"]): string {
+  switch (health) {
+    case "Available":
+      return "fill:#d4edda,stroke:#28a745";
+    case "Degraded":
+      return "fill:#fff3cd,stroke:#ffc107";
+    case "Unavailable":
+      return "fill:#f8d7da,stroke:#dc3545";
+    case "Unknown":
+      return "fill:#e2e3e5,stroke:#6c757d";
+  }
+}
+
+function healthIcon(health: TopologyNode["health"]): string {
+  switch (health) {
+    case "Available":
+      return "✅";
+    case "Degraded":
+      return "⚠️";
+    case "Unavailable":
+      return "❌";
+    case "Unknown":
+      return "❓";
+  }
+}
+
+/**
+ * Generate a Mermaid flowchart showing the resource dependency graph with health status.
+ */
+export function renderMermaidTopology(root: TopologyNode, dependencies: TopologyNode[]): string {
+  const lines: string[] = [];
+  lines.push("```mermaid");
+  lines.push("graph TD");
+
+  // Root node
+  lines.push(`    root["${root.name}<br/><i>${root.type}</i><br/>${healthIcon(root.health)} ${root.health}"]`);
+
+  // Dependency nodes
+  for (let i = 0; i < dependencies.length; i++) {
+    const dep = dependencies[i];
+    lines.push(`    dep${i}["${dep.name}<br/><i>${dep.type}</i><br/>${healthIcon(dep.health)} ${dep.health}"]`);
+  }
+
+  // Edges
+  for (let i = 0; i < dependencies.length; i++) {
+    lines.push(`    root --> dep${i}`);
+  }
+
+  // Styles
+  lines.push(`    style root ${healthColor(root.health)}`);
+  for (let i = 0; i < dependencies.length; i++) {
+    lines.push(`    style dep${i} ${healthColor(dependencies[i].health)}`);
+  }
+
+  lines.push("```");
+  return lines.join("\n");
+}
+
+/**
+ * Sanitize text for Mermaid syntax — remove characters that break rendering.
+ */
+function sanitizeMermaidText(text: string): string {
+  // Remove quotes, brackets, pipes, and other problematic chars
+  let sanitized = text.replace(/["\[\]|{}()<>]/g, "");
+  // Truncate to 60 chars
+  if (sanitized.length > 60) {
+    sanitized = sanitized.substring(0, 57) + "...";
+  }
+  return sanitized.trim();
+}
+
+/**
+ * Generate a Mermaid timeline diagram showing incident events grouped by phase.
+ */
+export function renderMermaidTimeline(
+  events: Array<{ time: string; event: string; source: string; severity?: string }>
+): string {
+  if (events.length === 0) {
+    return `\`\`\`mermaid
+timeline
+    title Incident Timeline
+    section No Data
+        -- : No events recorded
+\`\`\``;
+  }
+
+  // Sort events by time
+  const sorted = [...events].sort(
+    (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime()
+  );
+
+  // Find the index of the first critical or warning event
+  const firstAlertIdx = sorted.findIndex(
+    (e) => e.severity === "critical" || e.severity === "warning"
+  );
+
+  // Find the last critical or warning event to determine resolution boundary
+  let lastAlertIdx = -1;
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    if (sorted[i].severity === "critical" || sorted[i].severity === "warning") {
+      lastAlertIdx = i;
+      break;
+    }
+  }
+
+  // Classify events into phases
+  const preIncident: typeof sorted = [];
+  const incident: typeof sorted = [];
+  const resolution: typeof sorted = [];
+
+  for (let i = 0; i < sorted.length; i++) {
+    if (firstAlertIdx === -1) {
+      // No alerts at all — everything is pre-incident
+      preIncident.push(sorted[i]);
+    } else if (i < firstAlertIdx) {
+      preIncident.push(sorted[i]);
+    } else if (lastAlertIdx !== -1 && i > lastAlertIdx) {
+      resolution.push(sorted[i]);
+    } else {
+      incident.push(sorted[i]);
+    }
+  }
+
+  const lines: string[] = [];
+  lines.push("```mermaid");
+  lines.push("timeline");
+  lines.push("    title Incident Timeline");
+
+  const formatTime = (iso: string): string => {
+    const d = new Date(iso);
+    return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+  };
+
+  const renderEvent = (e: (typeof sorted)[0]): string => {
+    const time = formatTime(e.time);
+    const text = sanitizeMermaidText(e.event);
+    const severity = e.severity ? ` (${e.severity})` : "";
+    return `        ${time} : ${text}${severity}`;
+  };
+
+  if (preIncident.length > 0) {
+    lines.push("    section Pre-Incident");
+    for (const e of preIncident) {
+      lines.push(renderEvent(e));
+    }
+  }
+
+  if (incident.length > 0) {
+    lines.push("    section Incident");
+    for (const e of incident) {
+      lines.push(renderEvent(e));
+    }
+  }
+
+  if (resolution.length > 0) {
+    lines.push("    section Resolution");
+    for (const e of resolution) {
+      lines.push(renderEvent(e));
+    }
+  }
+
+  lines.push("```");
+  return lines.join("\n");
+}
+
 function severityIcon(severity: string): string {
   switch (severity) {
     case "critical":

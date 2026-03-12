@@ -8,7 +8,8 @@
     "build": "tsc && esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --outfile=build/index.js --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\" --external:@azure/* --external:@modelcontextprotocol/* --external:zod",
     "dev": "tsx src/index.ts",
     "start": "node build/index.js",
-    "inspect": "npx @modelcontextprotocol/inspector node build/index.js"
+    "inspect": "npx @modelcontextprotocol/inspector node build/index.js",
+    "test": "vitest run"
   },
   "dependencies": {
     "@azure/arm-monitor": "^7.0.0",
@@ -24,6 +25,7 @@
     "@types/node": "^22.0.0",
     "esbuild": "^0.27.3",
     "tsx": "^4.0.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^4.0.18"
   }
 }

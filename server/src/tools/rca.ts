@@ -11,25 +11,7 @@ import type { AzureError } from "../utils/azure-client.js";
 import { correlateTimelines, detectMetricAnomalies } from "../utils/correlator.js";
 import type { DiagnosticEvent } from "../utils/correlator.js";
 import { formatRCA } from "../utils/formatters.js";
-
-/** Same metric map as investigate — shared knowledge of common metrics per resource type */
-const METRIC_MAP: Record<string, { names: string[]; warningPct: number; criticalPct: number }> = {
-  "microsoft.web/sites": {
-    names: ["Http5xx", "HttpResponseTime", "CpuPercentage", "MemoryPercentage"],
-    warningPct: 80,
-    criticalPct: 90,
-  },
-  "microsoft.sql/servers/databases": {
-    names: ["dtu_consumption_percent", "connection_failed", "deadlock"],
-    warningPct: 80,
-    criticalPct: 90,
-  },
-  "microsoft.compute/virtualmachines": {
-    names: ["Percentage CPU", "Available Memory Bytes"],
-    warningPct: 80,
-    criticalPct: 90,
-  },
-};
+import { getMetricConfig } from "../utils/metric-config.js";
 
 export function registerRca(server: McpServer): void {
   server.tool(
@@ -50,6 +32,10 @@ export function registerRca(server: McpServer): void {
         .boolean()
         .default(true)
         .describe("Whether to include follow-up recommendations"),
+      outputFormat: z
+        .enum(["markdown", "json"])
+        .default("markdown")
+        .describe("Output format: markdown for human-readable RCA, json for structured data"),
     },
     async ({
       resource,
@@ -57,6 +43,7 @@ export function registerRca(server: McpServer): void {
       incidentStart,
       incidentEnd,
       includeRecommendations,
+      outputFormat,
     }) => {
       const subscription = await resolveSubscription(subParam);
       const errors: AzureError[] = [];
@@ -99,18 +86,15 @@ export function registerRca(server: McpServer): void {
       }
 
       // 2. Gather signals in parallel
+      const metricConfig = getMetricConfig(resourceType);
+
       const [healthResult, activityResult, metricsResult] =
         await Promise.all([
           getResourceHealth(subscription, resourceId),
           getActivityLogs(subscription, hoursBack, resourceId),
-          (async () => {
-            const typeKey = resourceType.toLowerCase();
-            const metricConfig = METRIC_MAP[typeKey];
-            if (metricConfig) {
-              return getMetrics(resourceId, metricConfig.names, hoursBack);
-            }
-            return { data: null, error: undefined };
-          })(),
+          metricConfig
+            ? getMetrics(resourceId, metricConfig.names, hoursBack)
+            : Promise.resolve({ data: null, error: undefined }),
         ]);
 
       // Process health
@@ -151,29 +135,25 @@ export function registerRca(server: McpServer): void {
       }
 
       // Process metrics
-      if (metricsResult.data) {
-        const typeKey = resourceType.toLowerCase();
-        const metricConfig = METRIC_MAP[typeKey];
-        if (metricConfig) {
-          for (const metric of metricsResult.data.metrics) {
-            for (const ts of metric.timeseries) {
-              if (!ts.data) continue;
-              const dataPoints = ts.data
-                .filter((dp) => dp.average !== undefined || dp.maximum !== undefined)
-                .map((dp) => ({
-                  timestamp:
-                    (dp as unknown as { timeStamp: Date }).timeStamp?.toISOString() ??
-                    new Date().toISOString(),
-                  average: dp.average ?? undefined,
-                  maximum: dp.maximum ?? undefined,
-                }));
-              allEvents.push(
-                ...detectMetricAnomalies(resourceId, metric.name, dataPoints, {
-                  warningPct: metricConfig.warningPct,
-                  criticalPct: metricConfig.criticalPct,
-                })
-              );
-            }
+      if (metricsResult.data && metricConfig) {
+        for (const metric of metricsResult.data.metrics) {
+          for (const ts of metric.timeseries) {
+            if (!ts.data) continue;
+            const dataPoints = ts.data
+              .filter((dp) => dp.average !== undefined || dp.maximum !== undefined)
+              .map((dp) => ({
+                timestamp:
+                  (dp as unknown as { timeStamp: Date }).timeStamp?.toISOString() ??
+                  new Date().toISOString(),
+                average: dp.average ?? undefined,
+                maximum: dp.maximum ?? undefined,
+              }));
+            allEvents.push(
+              ...detectMetricAnomalies(resourceId, metric.name, dataPoints, {
+                warningPct: metricConfig.warningPct,
+                criticalPct: metricConfig.criticalPct,
+              })
+            );
           }
         }
       }
@@ -229,7 +209,7 @@ export function registerRca(server: McpServer): void {
       }
 
       // 7. Format as RCA document
-      const rca = formatRCA({
+      const rcaInput = {
         resource: resourceName,
         resourceType,
         subscription,
@@ -245,8 +225,20 @@ export function registerRca(server: McpServer): void {
           ? ["Incident was resolved (end time provided)."]
           : ["Incident may still be ongoing."],
         recommendations,
-      });
+      };
 
+      if (outputFormat === "json") {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({
+            ...rcaInput,
+            confidence: correlation.confidence,
+            cascadingFailure: correlation.cascadingFailure,
+            generatedAt: new Date().toISOString(),
+          }, null, 2) }],
+        };
+      }
+
+      const rca = formatRCA(rcaInput);
       return {
         content: [{ type: "text" as const, text: rca }],
       };

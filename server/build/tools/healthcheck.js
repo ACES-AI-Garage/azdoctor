@@ -23,8 +23,28 @@ export function registerHealthcheck(server) {
         if (resourceList.error)
             errors.push(resourceList.error);
         const scannedResources = resourceList.totalRecords;
-        // 2. Batch-check Resource Health
-        const healthResult = await batchResourceHealth(subscription, resourceGroup);
+        // 2. Run health checks, activity log checks, and Resource Graph misconfiguration checks in parallel
+        const [healthResult, activityResult, ...rgCheckResults] = await Promise.all([
+            // Health check
+            batchResourceHealth(subscription, resourceGroup),
+            // Activity logs
+            getActivityLogs(subscription, 24, undefined, resourceGroup),
+            // Resource Graph checks for common misconfigurations
+            queryResourceGraph([subscription], resourceGroup
+                ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Compute/disks' and properties.diskState == 'Unattached' | project id, name, type, location, resourceGroup`
+                : `Resources | where type =~ 'Microsoft.Compute/disks' and properties.diskState == 'Unattached' | project id, name, type, location, resourceGroup`),
+            queryResourceGraph([subscription], resourceGroup
+                ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Network/publicIPAddresses' and properties.ipConfiguration == '' | project id, name, type, location, resourceGroup`
+                : `Resources | where type =~ 'Microsoft.Network/publicIPAddresses' and properties.ipConfiguration == '' | project id, name, type, location, resourceGroup`),
+            queryResourceGraph([subscription], resourceGroup
+                ? `Resources | where resourceGroup =~ '${resourceGroup}' and (type startswith 'Microsoft.ClassicCompute' or type startswith 'Microsoft.ClassicNetwork' or type startswith 'Microsoft.ClassicStorage') | project id, name, type, location, resourceGroup`
+                : `Resources | where type startswith 'Microsoft.ClassicCompute' or type startswith 'Microsoft.ClassicNetwork' or type startswith 'Microsoft.ClassicStorage' | project id, name, type, location, resourceGroup`),
+            queryResourceGraph([subscription], resourceGroup
+                ? `Resources | where resourceGroup =~ '${resourceGroup}' and (type =~ 'Microsoft.Sql/servers' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.DocumentDB/databaseAccounts') | project id, name, type, resourceGroup`
+                : `Resources | where (type =~ 'Microsoft.Sql/servers' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.DocumentDB/databaseAccounts') | project id, name, type, resourceGroup`),
+        ]);
+        const [unattachedDisksResult, unassociatedIPsResult, classicResourcesResult, criticalResourcesResult] = rgCheckResults;
+        // Process Resource Health findings
         if (healthResult.error) {
             errors.push(healthResult.error);
         }
@@ -63,8 +83,7 @@ export function registerHealthcheck(server) {
                 }
             }
         }
-        // 3. Pull Activity Log for last 24h — count changes per resource, flag unusual velocity
-        const activityResult = await getActivityLogs(subscription, 24, undefined, resourceGroup);
+        // Process Activity Log findings
         if (activityResult.error) {
             errors.push(activityResult.error);
         }
@@ -109,6 +128,94 @@ export function registerHealthcheck(server) {
                 }
             }
         }
+        // Process Resource Graph misconfiguration findings
+        // Unattached disks
+        let unattachedDiskCount = 0;
+        if (unattachedDisksResult.error) {
+            errors.push(unattachedDisksResult.error);
+        }
+        else {
+            for (const disk of unattachedDisksResult.resources) {
+                unattachedDiskCount++;
+                findings.push({
+                    severity: "warning",
+                    resource: String(disk.name ?? "unknown"),
+                    resourceType: "Microsoft.Compute/disks",
+                    issue: `Unattached managed disk detected — incurring cost without being used.`,
+                    evidence: {
+                        id: disk.id,
+                        location: disk.location,
+                        resourceGroup: disk.resourceGroup,
+                    },
+                    recommendation: "Delete the disk if no longer needed, or reattach it to a VM to avoid wasted cost.",
+                });
+            }
+        }
+        // Unassociated Public IPs
+        let unassociatedIPCount = 0;
+        if (unassociatedIPsResult.error) {
+            errors.push(unassociatedIPsResult.error);
+        }
+        else {
+            for (const ip of unassociatedIPsResult.resources) {
+                unassociatedIPCount++;
+                findings.push({
+                    severity: "info",
+                    resource: String(ip.name ?? "unknown"),
+                    resourceType: "Microsoft.Network/publicIPAddresses",
+                    issue: `Public IP address is not associated with any resource.`,
+                    evidence: {
+                        id: ip.id,
+                        location: ip.location,
+                        resourceGroup: ip.resourceGroup,
+                    },
+                    recommendation: "Review whether this public IP is still needed. Unassociated public IPs may pose a security risk and incur cost.",
+                });
+            }
+        }
+        // Classic resources
+        let classicResourceCount = 0;
+        if (classicResourcesResult.error) {
+            errors.push(classicResourcesResult.error);
+        }
+        else {
+            for (const res of classicResourcesResult.resources) {
+                classicResourceCount++;
+                findings.push({
+                    severity: "warning",
+                    resource: String(res.name ?? "unknown"),
+                    resourceType: String(res.type ?? "Microsoft.Classic*"),
+                    issue: `Classic (ASM) resource detected — this deployment model is deprecated.`,
+                    evidence: {
+                        id: res.id,
+                        type: res.type,
+                        location: res.location,
+                        resourceGroup: res.resourceGroup,
+                    },
+                    recommendation: "Migrate to Azure Resource Manager (ARM). Classic resources will be retired. See https://aka.ms/classicresourcemigration.",
+                });
+            }
+        }
+        // Critical resources without locks
+        if (criticalResourcesResult.error) {
+            errors.push(criticalResourcesResult.error);
+        }
+        else {
+            for (const res of criticalResourcesResult.resources) {
+                findings.push({
+                    severity: "info",
+                    resource: String(res.name ?? "unknown"),
+                    resourceType: String(res.type ?? "unknown"),
+                    issue: `Critical resource type detected — review whether resource locks are configured.`,
+                    evidence: {
+                        id: res.id,
+                        type: res.type,
+                        resourceGroup: res.resourceGroup,
+                    },
+                    recommendation: "Consider adding a CanNotDelete or ReadOnly lock to protect this critical resource from accidental deletion or modification.",
+                });
+            }
+        }
         // 4. Filter by severity threshold
         const severityRank = {
             critical: 3,
@@ -121,7 +228,12 @@ export function registerHealthcheck(server) {
         const criticalCount = filtered.filter((f) => f.severity === "critical").length;
         const warningCount = filtered.filter((f) => f.severity === "warning").length;
         const infoCount = filtered.filter((f) => f.severity === "info").length;
-        const riskScore = Math.min(100, criticalCount * 30 + warningCount * 10 + infoCount * 2);
+        const riskScore = Math.min(100, criticalCount * 30 +
+            warningCount * 10 +
+            infoCount * 2 +
+            unattachedDiskCount * 3 +
+            classicResourceCount * 5 +
+            unassociatedIPCount * 2);
         const healthyCount = Math.max(0, scannedResources - criticalCount - warningCount);
         const response = {
             riskScore,
