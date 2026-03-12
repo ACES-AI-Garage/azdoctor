@@ -119,7 +119,19 @@ export function createMetricsQueryClient() {
 export function createSupportClient(subscriptionId) {
     return new MicrosoftSupport(getCredential(), subscriptionId);
 }
-export async function queryResourceGraph(subscriptions, query) {
+const resourceGraphCache = new Map();
+const RESOURCE_GRAPH_CACHE_TTL_MS = 60_000; // 60 seconds
+export function clearResourceGraphCache() {
+    resourceGraphCache.clear();
+}
+export async function queryResourceGraph(subscriptions, query, skipCache = false) {
+    const cacheKey = JSON.stringify({ subscriptions, query });
+    if (!skipCache) {
+        const cached = resourceGraphCache.get(cacheKey);
+        if (cached && cached.expiry > Date.now()) {
+            return cached.result;
+        }
+    }
     try {
         const client = createResourceGraphClient();
         const request = {
@@ -128,11 +140,57 @@ export async function queryResourceGraph(subscriptions, query) {
             options: { resultFormat: "objectArray" },
         };
         const response = await withRetry(() => client.resources(request));
-        const data = response.data ?? [];
-        return { resources: data, totalRecords: response.totalRecords ?? data.length };
+        const allData = response.data ?? [];
+        const totalRecords = response.totalRecords ?? allData.length;
+        // Paginate if there are more results (safety limit: 10 pages)
+        const MAX_PAGES = 10;
+        let skipToken = response.skipToken;
+        let page = 1;
+        while (skipToken && page < MAX_PAGES) {
+            const pagedRequest = {
+                subscriptions,
+                query,
+                options: { resultFormat: "objectArray", skipToken },
+            };
+            const pagedResponse = await withRetry(() => client.resources(pagedRequest));
+            const pageData = pagedResponse.data ?? [];
+            allData.push(...pageData);
+            skipToken = pagedResponse.skipToken;
+            page++;
+        }
+        const result = {
+            resources: allData,
+            totalRecords,
+        };
+        resourceGraphCache.set(cacheKey, {
+            result,
+            expiry: Date.now() + RESOURCE_GRAPH_CACHE_TTL_MS,
+        });
+        return result;
     }
     catch (err) {
         return { resources: [], totalRecords: 0, error: classifyError(err, "resourceGraph") };
+    }
+}
+export async function getResourceDiagnosticSettings(subscriptionId, resourceUri) {
+    try {
+        const client = createMonitorClient(subscriptionId);
+        const response = await withRetry(() => client.diagnosticSettings.list(resourceUri));
+        const settings = (response.value ?? []).map((setting) => ({
+            name: setting.name ?? "",
+            workspaceId: setting.workspaceId ?? "",
+            // Note: The workspace GUID (customerId) cannot be obtained from diagnostic
+            // settings alone — it would require a separate call to the workspace resource.
+            workspaceCustomerId: undefined,
+            logs: (setting.logs ?? [])
+                .filter((log) => log.enabled)
+                .map((log) => log.category ?? ""),
+            metrics: (setting.metrics ?? []).some((m) => m.enabled),
+        }));
+        return { settings };
+    }
+    catch (err) {
+        return { settings: [], error: classifyError(err, "diagnosticSettings") };
     }
 }
 export async function getResourceHealth(subscriptionId, resourceUri) {
@@ -161,7 +219,7 @@ export async function batchResourceHealth(subscriptionId, resourceGroup) {
         return { statuses: [], error: classifyError(err, "resourceHealth") };
     }
 }
-export async function getActivityLogs(subscriptionId, hoursBack = 24, resourceUri, resourceGroup) {
+export async function getActivityLogs(subscriptionId, hoursBack = 24, resourceUri, resourceGroup, maxEvents = 1000) {
     try {
         const client = createMonitorClient(subscriptionId);
         const now = new Date();
@@ -176,6 +234,9 @@ export async function getActivityLogs(subscriptionId, hoursBack = 24, resourceUr
         const events = [];
         for await (const event of client.activityLogs.list(filter)) {
             events.push(event);
+            if (events.length >= maxEvents) {
+                break;
+            }
         }
         return { events };
     }
@@ -225,5 +286,32 @@ export async function queryLogAnalytics(workspaceId, query, timespanHours = 24) 
     catch (err) {
         return { tables: [], error: classifyError(err, "logAnalytics") };
     }
+}
+export async function discoverWorkspaces(subscriptionId, resourceGroup) {
+    let query = "Resources | where type =~ 'Microsoft.OperationalInsights/workspaces' | project id, name, properties.customerId";
+    if (resourceGroup) {
+        query =
+            `Resources | where type =~ 'Microsoft.OperationalInsights/workspaces' | where resourceGroup =~ '${resourceGroup}' | project id, name, properties.customerId`;
+    }
+    const result = await queryResourceGraph([subscriptionId], query);
+    if (result.error) {
+        return { workspaces: [], error: result.error };
+    }
+    const workspaces = result.resources.map((r) => ({
+        workspaceId: r["properties_customerId"] ?? "",
+        workspaceName: r["name"] ?? "",
+        resourceId: r["id"] ?? "",
+    }));
+    return { workspaces };
+}
+// ─── Concurrency Limiter ────────────────────────────────────────────
+export async function batchExecute(tasks, batchSize = 5) {
+    const results = [];
+    for (let i = 0; i < tasks.length; i += batchSize) {
+        const batch = tasks.slice(i, i + batchSize);
+        const batchResults = await Promise.all(batch.map((fn) => fn()));
+        results.push(...batchResults);
+    }
+    return results;
 }
 //# sourceMappingURL=azure-client.js.map

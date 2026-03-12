@@ -31,7 +31,19 @@ export interface ResourceGraphResult {
     totalRecords: number;
     error?: AzureError;
 }
-export declare function queryResourceGraph(subscriptions: string[], query: string): Promise<ResourceGraphResult>;
+export declare function clearResourceGraphCache(): void;
+export declare function queryResourceGraph(subscriptions: string[], query: string, skipCache?: boolean): Promise<ResourceGraphResult>;
+export interface DiagnosticSettingInfo {
+    name: string;
+    workspaceId: string;
+    workspaceCustomerId?: string;
+    logs: string[];
+    metrics: boolean;
+}
+export declare function getResourceDiagnosticSettings(subscriptionId: string, resourceUri: string): Promise<{
+    settings: DiagnosticSettingInfo[];
+    error?: AzureError;
+}>;
 export interface HealthResult {
     statuses: AvailabilityStatus[];
     error?: AzureError;
@@ -42,7 +54,7 @@ export interface ActivityLogResult {
     events: EventData[];
     error?: AzureError;
 }
-export declare function getActivityLogs(subscriptionId: string, hoursBack?: number, resourceUri?: string, resourceGroup?: string): Promise<ActivityLogResult>;
+export declare function getActivityLogs(subscriptionId: string, hoursBack?: number, resourceUri?: string, resourceGroup?: string, maxEvents?: number): Promise<ActivityLogResult>;
 export interface MetricsResult {
     data: MetricsQueryResult | null;
     error?: AzureError;
@@ -57,4 +69,14 @@ export interface LogAnalyticsResult {
     error?: AzureError;
 }
 export declare function queryLogAnalytics(workspaceId: string, query: string, timespanHours?: number): Promise<LogAnalyticsResult>;
+export interface WorkspaceInfo {
+    workspaceId: string;
+    workspaceName: string;
+    resourceId: string;
+}
+export declare function discoverWorkspaces(subscriptionId: string, resourceGroup?: string): Promise<{
+    workspaces: WorkspaceInfo[];
+    error?: AzureError;
+}>;
+export declare function batchExecute<T>(tasks: (() => Promise<T>)[], batchSize?: number): Promise<T[]>;
 //# sourceMappingURL=azure-client.d.ts.map
