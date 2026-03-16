@@ -1,0 +1,14 @@
+{
+  "name": "azdoctor-demo-app",
+  "version": "1.0.0",
+  "description": "Sample app for AZ Doctor demo — generates telemetry for diagnostics",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "applicationinsights": "^2.9.5",
+    "express": "^4.21.0",
+    "tedious": "^18.6.1"
+  }
+}

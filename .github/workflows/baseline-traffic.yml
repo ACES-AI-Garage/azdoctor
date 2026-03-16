@@ -1,0 +1,21 @@
+name: Baseline Traffic
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # Every 15 minutes
+  workflow_dispatch: # Manual trigger for testing
+
+jobs:
+  send-traffic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Send baseline traffic
+        run: |
+          APP_URL="https://app-azdemo-prod-30bf1e4b.azurewebsites.net"
+          for i in $(seq 1 10); do
+            curl -s -o /dev/null --max-time 10 "$APP_URL/health" || true
+            curl -s -o /dev/null --max-time 10 "$APP_URL/api/data" || true
+            sleep 2
+          done
+          echo "Baseline traffic sent at $(date -u)"
