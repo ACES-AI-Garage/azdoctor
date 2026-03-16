@@ -273,9 +273,32 @@ All API calls use `DefaultAzureCredential` from `@azure/identity`. Just run `az 
 
 **Minimum role:** Reader on the target subscription. Log Analytics queries may need Log Analytics Reader. Run `azdoctor_check_permissions` to verify.
 
-## Standalone MCP Server
+## Other MCP Clients
 
-AZ Doctor works with any MCP-compatible client, not just Copilot CLI. Add to your MCP config:
+AZ Doctor is a standard MCP server — it works with any MCP-compatible client, not just Copilot CLI. The 18 tools work independently; agents and skills are Copilot CLI-specific.
+
+### GitHub Copilot (VS Code / Desktop)
+
+In VS Code with Copilot Chat, add to your workspace `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "azdoctor": {
+      "command": "node",
+      "args": ["/path/to/azdoctor/server/build/index.js"]
+    }
+  }
+}
+```
+
+Or configure globally via **Settings > GitHub Copilot > MCP Servers**.
+
+### Claude Desktop
+
+Add to your Claude Desktop config:
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 
 ```json
 {
@@ -288,11 +311,24 @@ AZ Doctor works with any MCP-compatible client, not just Copilot CLI. Add to you
 }
 ```
 
-Works with Claude Desktop, Claude Code, Cursor, VS Code, and any other MCP client. The 18 tools work independently — agents and skills are Copilot CLI-specific.
+### Claude Code
 
-**Config file locations:**
-- Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
-- Claude Code: `.mcp.json` in your project root or global config
+Add to `.mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "azdoctor": {
+      "command": "node",
+      "args": ["/path/to/azdoctor/server/build/index.js"]
+    }
+  }
+}
+```
+
+### Any Other MCP Client
+
+AZ Doctor uses STDIO transport. Point any MCP client at `node /path/to/azdoctor/server/build/index.js`.
 
 ## Configuration
 
