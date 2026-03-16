@@ -2,103 +2,23 @@
 
 **AI-powered Azure diagnostics for GitHub Copilot CLI.**
 
-Multi-signal correlation, root cause analysis, and proactive risk scoring — delivered as a Copilot CLI plugin backed by an MCP server.
+Ask a question in natural language, get a structured diagnosis backed by live Azure data — resource health, metrics, activity logs, dependencies, and Microsoft Learn docs, all correlated automatically.
 
-## The Idea
-
-Azure MCP Server gives you the **stethoscope** — raw signals from health APIs, activity logs, and metrics.
-
-Microsoft Learn MCP Server gives you the **medical textbook** — troubleshooting guides, error references, and diagnostic documentation for 200+ Azure services.
-
-AZ Doctor gives you the **doctor** — diagnostic reasoning that correlates signals across sources, identifies root causes, and produces structured output engineers actually need.
-
-No single existing tool combines all three. AZ Doctor is the orchestration layer that ties them together.
-
-## What It Does
-
-**Reactive investigation** — "Why is my app slow?" One prompt triggers a full diagnostic workflow: resource health, activity logs, metrics, dependent resources, and timestamp correlation across all signals. What used to take 5+ manual queries and mental correlation now takes one question.
-
-**Root cause analysis** — "Generate an RCA for this incident." Produces a structured markdown document with correlated timeline, root cause narrative, impact assessment, and remediation steps. Ready for ServiceNow, post-incident reviews, or management.
-
-**Proactive health checks** — "Check the health of my production subscription." Scans all resources, scores risks (0-100), detects misconfigurations (unattached disks, orphaned public IPs, classic resources), and surfaces critical issues before they cause outages.
-
-**Environment comparison** — "Compare prod vs staging." Diffs resource inventory, health status, and change velocity between two scopes. Flags parity issues before deployments.
-
-## Architecture
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│  GitHub Copilot CLI                                            │
-│  (UI, conversational loop, model, tool execution)              │
-├────────────────────────────────────────────────────────────────┤
-│  AZ Doctor Plugin                                              │
-│  ├─ plugin.json        Plugin manifest                         │
-│  ├─ agents/            Diagnostic agent instructions           │
-│  ├─ skills/            Workflow templates                      │
-│  └─ mcp-config.json    Wires up the MCP server                │
-├────────────────────────────────────────────────────────────────┤
-│                    MCP SERVER LAYER                             │
-│                                                                │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐ │
-│  │ Azure MCP    │  │ Learn MCP    │  │ AZ Doctor MCP Server │ │
-│  │ Server       │  │ Server       │  │ (this repo)          │ │
-│  │              │  │              │  │                      │ │
-│  │ Live data:   │  │ Knowledge:   │  │ Orchestration:       │ │
-│  │ • Health     │  │ • TSGs       │  │ • Correlation        │ │
-│  │ • Logs       │  │ • Docs       │  │ • RCA generation     │ │
-│  │ • Metrics    │  │ • How-tos    │  │ • Risk scoring       │ │
-│  │ • Resources  │  │ • Error refs │  │ • Perm checks        │ │
-│  └──────┬───────┘  └──────┬───────┘  └────────┬─────────────┘ │
-│         ▼                 ▼                    ▼               │
-│    Azure APIs      learn.microsoft.com      Azure APIs         │
-│    (via az login)  (public, no auth)        (via az login)     │
-└────────────────────────────────────────────────────────────────┘
-```
-
-## Tools
-
-| Tool | Purpose |
-|------|---------|
-| `azdoctor_healthcheck` | Subscription-wide health scan with risk scoring and misconfiguration detection |
-| `azdoctor_investigate` | Multi-signal investigation with dependency discovery, diagnostic patterns, trend detection, and confidence scoring |
-| `azdoctor_rca` | Structured Root Cause Analysis document generation (markdown or JSON) |
-| `azdoctor_check_permissions` | Live probe of Azure API access with RBAC role recommendations |
-| `azdoctor_compare` | Compare health and resources between two Azure scopes (e.g., prod vs staging) |
-| `azdoctor_remediate` | Execute safe remediation actions (restart, scale, failover) with dry-run mode and risk ratings |
-| `azdoctor_query` | Natural language to KQL — auto-discovers workspaces and runs queries |
-| `azdoctor_cost` | Cost waste analysis — finds idle resources, oversized VMs, orphaned storage |
-| `azdoctor_playback` | Incident timeline replay with phase markers and contextual explanations |
-| `azdoctor_alert_rules` | Generate Azure Monitor alert recommendations with deployable Bicep templates |
-| `azdoctor_sweep` | Multi-subscription health sweep — ranks all subscriptions by risk score |
-| `azdoctor_baseline` | Compare current metrics against 7-day baseline to detect anomalies |
-| `azdoctor_journal` | Save, list, and retrieve investigation results as local markdown files |
-| `azdoctor_triage` | Full diagnostic pipeline in one call — permissions, investigation, baseline, alerts, and journal save |
-| `azdoctor_diagram` | Generate Mermaid dependency topology and incident timeline diagrams |
-| `azdoctor_advisor` | Pull Azure Advisor recommendations with optional investigation correlation |
-| `azdoctor_notify` | Send investigation summaries to Teams, Slack, or any webhook |
-| `azdoctor_playbooks` | Manage custom diagnostic runbooks with trigger-based matching |
-
-All tools auto-detect your Azure subscription from `az CLI` — no need to pass a subscription ID.
-
-## Install
+## Quick Start
 
 ### Prerequisites
 
-- [GitHub Copilot CLI](https://docs.github.com/en/copilot) installed and working (`copilot` command in your terminal)
-- Azure CLI installed and logged in (`az login`)
+- [GitHub Copilot CLI](https://docs.github.com/en/copilot) installed
+- Azure CLI logged in (`az login`)
 - Node.js 18+
 
-### Step 1: Install the plugin
-
-In Copilot CLI, run:
+### Install
 
 ```
 /plugin install ACES-AI-Garage/azdoctor
 ```
 
-### Step 2: Install server dependencies
-
-The MCP server needs its npm dependencies. Run this once after installing the plugin:
+Then install the MCP server dependencies:
 
 **Windows (PowerShell):**
 ```powershell
@@ -112,161 +32,250 @@ cd ~/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor/server
 npm install --omit=dev
 ```
 
-### Step 3: Restart and verify
-
-Restart Copilot CLI, then run:
-
-```
-/mcp show azdoctor
-```
-
-You should see the `azdoctor` server listed with 18 tools. If it shows "not found", close Copilot CLI completely and reopen it.
-
-### Updating
-
-To pull the latest version:
-
-**Windows (PowerShell):**
-```powershell
-cd "$env:USERPROFILE\.copilot\installed-plugins\_direct\ACES-AI-Garage--azdoctor"
-git pull
-cd server
-npm install --omit=dev
-```
-
-**macOS / Linux:**
-```bash
-cd ~/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor
-git pull
-cd server
-npm install --omit=dev
-```
-
-Then restart Copilot CLI.
+Restart Copilot CLI. Verify with `/mcp show azdoctor` — you should see 18 tools.
 
 ## Usage
 
-Once installed, use the `@azure-diagnostics` agent in Copilot CLI:
+Talk to the `@azure-diagnostics` agent in natural language. Here's what it looks like in practice:
 
-```
-@azure-diagnostics Check the health of my subscription
+---
+
+**"Check the health of my subscription"**
+
+Scans all resources and returns a risk score with specific findings:
+
+```json
+{
+  "riskScore": 34,
+  "summary": "3 critical, 8 warning, 247 healthy",
+  "scannedResources": 258,
+  "findings": [
+    {
+      "severity": "critical",
+      "resource": "sqldb-orders-prod",
+      "issue": "Resource health: Degraded",
+      "recommendation": "Check Azure Status for known issues, review recent changes"
+    },
+    {
+      "severity": "warning",
+      "resource": "disk-old-backup",
+      "issue": "Unattached managed disk (200 GB, Premium_LRS)",
+      "recommendation": "Delete if no longer needed to save ~$27/month"
+    }
+  ]
+}
 ```
 
-```
-@azure-diagnostics Why is my app service prod-api returning 500 errors?
+---
+
+**"Why is my app service prod-api returning 500 errors?"**
+
+Correlates health, activity logs, metrics, and dependencies to find the root cause:
+
+```json
+{
+  "resource": "prod-api",
+  "currentHealth": "Degraded",
+  "confidence": "high",
+  "cascadingFailure": true,
+  "likelyCause": "Deployment at 14:23 UTC introduced a breaking change — HTTP 5xx rate jumped from 0.1% to 34% within 2 minutes of deployment completion",
+  "diagnosticInsights": [
+    { "pattern": "bad_deployment", "confidence": 0.92, "detail": "5xx spike correlates with deployment event at 14:23" }
+  ],
+  "metricTrends": [
+    { "metric": "Http5xx", "direction": "rising", "rSquared": 0.94 }
+  ],
+  "dependentResources": [
+    { "name": "sqldb-orders-prod", "type": "Microsoft.Sql/servers/databases", "health": "Degraded" }
+  ],
+  "recommendedActions": [
+    "Roll back deployment from 14:23 UTC",
+    "Investigate SQL dependency — sqldb-orders-prod is also degraded",
+    "Review application logs for exception details"
+  ]
+}
 ```
 
+---
+
+**"Find cost waste in my subscription"**
+
+Identifies idle resources and right-sizing opportunities:
+
+```json
+{
+  "totalFindings": 6,
+  "estimatedMonthlyWaste": "$847.00",
+  "findings": [
+    {
+      "category": "stopped_vm",
+      "resource": "vm-dev-test-03",
+      "detail": "VM is stopped but still allocated — compute charges continue",
+      "estimatedMonthlyCost": "$312.00",
+      "recommendation": "Deallocate the VM or delete if no longer needed"
+    },
+    {
+      "category": "oversized_vm",
+      "resource": "vm-batch-worker",
+      "detail": "Standard_D8s_v3 averaging 6% CPU over 7 days",
+      "recommendation": "Downsize to Standard_D2s_v3 — saves ~$380/month"
+    },
+    {
+      "category": "unattached_disk",
+      "resource": "disk-old-snapshot",
+      "detail": "Premium SSD 512 GB, unattached",
+      "estimatedMonthlyCost": "$73.00",
+      "recommendation": "Delete if no longer needed"
+    }
+  ]
+}
 ```
-@azure-diagnostics Investigate sqlserver-nexus-corbin in resource group Nexus-Corbin
+
+---
+
+**"Run a full triage on prod-api"**
+
+One command runs the full pipeline — permissions, investigation, baseline, alerts, and saves a report:
+
+```json
+{
+  "resource": "prod-api",
+  "triageDuration": "8.3s",
+  "currentHealth": "Degraded",
+  "confidence": "high",
+  "likelyCause": "Deployment at 14:23 UTC caused 5xx spike",
+  "topology": "prod-api (Degraded)\n  ├── sqldb-orders-prod (Degraded)\n  └── redis-session-cache (Available)",
+  "baseline": {
+    "overallStatus": "anomalous",
+    "metrics": [
+      { "metric": "CpuPercentage", "current": 89, "mean": 42, "zScore": 3.1, "status": "anomalous" },
+      { "metric": "Http5xx", "current": 847, "mean": 12, "zScore": 5.8, "status": "anomalous" }
+    ]
+  },
+  "alertRecommendations": [
+    { "name": "High CPU Alert", "metric": "CpuPercentage", "threshold": 85, "description": "CPU exceeded 85% — fire before saturation" }
+  ],
+  "journalSaved": true,
+  "journalPath": "~/.azdoctor/journal/prod-api-2026-03-16T15-30-00Z.md"
+}
 ```
+
+---
+
+More examples of what you can ask:
 
 ```
 @azure-diagnostics Generate an RCA for the outage on prod-api between 2pm and 4pm UTC today
-```
-
-```
-@azure-diagnostics Compare the health of resource group prod-rg vs staging-rg
-```
-
-```
-@azure-diagnostics Check what Azure APIs my credentials can access
-```
-
-```
+@azure-diagnostics Compare prod-rg vs staging-rg
 @azure-diagnostics Is my prod-api CPU usage normal right now?
-```
-
-```
-@azure-diagnostics Show me failed requests for prod-api in the last hour
-```
-
-```
-@azure-diagnostics Find cost waste in my subscription
-```
-
-```
-@azure-diagnostics Replay what happened to prod-api between 2pm and 4pm UTC
-```
-
-```
 @azure-diagnostics Restart prod-api to mitigate the issue
-```
-
-```
+@azure-diagnostics Show me failed requests in the last hour
+@azure-diagnostics Send the investigation results to our Teams channel
 @azure-diagnostics Generate alert rules for prod-api based on the investigation
-```
-
-```
 @azure-diagnostics Scan all my subscriptions for health issues
 ```
 
-```
-@azure-diagnostics Run a full triage on prod-api
-```
+Four skills are also available as shortcuts: `/diagnose`, `/healthcheck`, `/rca`, `/compare`
+
+## What's Inside
+
+### 18 MCP Tools
+
+**Detect** — find problems before users do
+
+| Tool | What it does |
+|------|-------------|
+| `azdoctor_healthcheck` | Subscription-wide health scan with 0-100 risk scoring and misconfiguration detection |
+| `azdoctor_sweep` | Scan all accessible subscriptions in parallel, ranked by risk |
+| `azdoctor_advisor` | Pull Azure Advisor recommendations (reliability, security, performance, cost) |
+| `azdoctor_check_permissions` | Verify which Azure APIs your credentials can access |
+
+**Diagnose** — understand what went wrong and why
+
+| Tool | What it does |
+|------|-------------|
+| `azdoctor_investigate` | Multi-signal correlation: health + logs + metrics + dependencies + trend detection |
+| `azdoctor_query` | Natural language to KQL — auto-discovers Log Analytics workspaces |
+| `azdoctor_baseline` | "Is this normal?" — compares current metrics against a 7-day baseline |
+| `azdoctor_compare` | Diff two resource groups or subscriptions (e.g., prod vs staging) |
+| `azdoctor_triage` | Full pipeline in one call: permissions → investigate → baseline → alerts → journal |
+
+**Act** — fix issues and prevent recurrence
+
+| Tool | What it does |
+|------|-------------|
+| `azdoctor_remediate` | Restart, scale, or failover resources with dry-run mode and risk ratings |
+| `azdoctor_alert_rules` | Generate Azure Monitor alert rules with deployable Bicep templates |
+| `azdoctor_cost` | Find waste: idle resources, oversized VMs, orphaned storage |
+
+**Report** — document and share findings
+
+| Tool | What it does |
+|------|-------------|
+| `azdoctor_rca` | Structured Root Cause Analysis (markdown or JSON) |
+| `azdoctor_playback` | Incident timeline replay with phase markers for post-incident reviews |
+| `azdoctor_diagram` | Mermaid dependency topology and incident timeline diagrams |
+| `azdoctor_journal` | Save and retrieve investigation results as local markdown files |
+| `azdoctor_notify` | Send summaries to Teams, Slack, or any webhook |
+| `azdoctor_playbooks` | Manage custom diagnostic runbooks with trigger-based matching |
+
+All tools auto-detect your subscription from `az CLI` — no subscription ID needed.
+
+### Resource Coverage
+
+Built-in metric profiles and dependency discovery for 21+ resource types:
+
+App Service, App Service Plans, VMs, AKS, SQL Database, Cosmos DB, MySQL Flexible, PostgreSQL Flexible, Redis Cache, Storage Accounts, Application Gateway, Load Balancer, Azure Firewall, CDN, Service Bus, Event Hub, Cognitive Services, API Management, Key Vault, SignalR
+
+For services without built-in profiles, AZ Doctor pulls troubleshooting docs from **Microsoft Learn** at runtime and applies them to live diagnostic data — covering 200+ Azure services without custom code.
+
+### Diagnostic Intelligence
+
+- **11 diagnostic patterns**: bad deployment, memory exhaustion, CPU saturation, health check failure, DTU exhaustion, connection storm, deadlock storm, disk bottleneck, network saturation, platform incident, rapid config changes
+- **Metric trend detection** via linear regression with R² confidence
+- **Cascading failure detection** via event clustering
+- **Confidence scoring** (high/medium/low) based on signal correlation quality
+
+## How It Works
+
+AZ Doctor sits between you and three data sources:
 
 ```
-@azure-diagnostics Generate a dependency diagram for prod-api
+You (natural language)
+ │
+ ▼
+┌──────────────────────────────────────────────────┐
+│              AZ Doctor MCP Server                 │
+│                                                   │
+│  Correlates signals, detects patterns,            │
+│  generates RCAs, recommends actions               │
+├──────────┬──────────────────┬────────────────────┤
+│  Azure   │  Microsoft Learn │  Azure Advisor /   │
+│  APIs    │  MCP Server      │  Resource Graph    │
+│          │                  │                    │
+│  Health  │  Troubleshooting │  Recommendations   │
+│  Logs    │  guides & docs   │  & resource data   │
+│  Metrics │  for 200+ services│                   │
+└──────────┴──────────────────┴────────────────────┘
+     ▲              ▲                  ▲
+  az login     public API          az login
 ```
 
-```
-@azure-diagnostics Send the investigation results to our Teams channel
-```
+**Layer 1** — For 21+ resource types, AZ Doctor has built-in diagnostic playbooks with specific metrics, thresholds, and patterns. Fast and deterministic.
 
-```
-@azure-diagnostics Show Azure Advisor recommendations for my subscription
-```
+**Layer 2** — For everything else, it queries Microsoft Learn for troubleshooting docs and applies them to live data. Covers 200+ services without custom code.
 
-You can also use the skills directly:
-
-```
-/diagnose — Investigate a specific Azure resource issue
-/healthcheck — Scan your subscription for health issues and risks
-/rca — Generate a structured Root Cause Analysis report
-/compare — Compare two Azure environments
-```
-
-## Three-Layer Knowledge Strategy
-
-AZ Doctor doesn't need hand-coded playbooks for every Azure service. It uses a layered approach:
-
-**Layer 1 — Hard-coded playbooks** (high confidence): Deep diagnostic workflows with built-in metric profiles for 21+ resource types (App Service, VMs, AKS, SQL, Cosmos DB, Redis, Storage, App Gateway, Load Balancer, Firewall, CDN, Service Bus, Event Hub, Key Vault, API Management, Cognitive Services, SignalR, MySQL, PostgreSQL). Deterministic, fast, no RAG needed.
-
-**Layer 2 — RAG from Microsoft Learn** (medium confidence): For any other service, the agent queries the Learn MCP Server for troubleshooting docs at runtime and applies them to live diagnostic data. Covers 200+ Azure services without custom code.
-
-**Layer 3 — Generic heuristics** (lower confidence): For novel scenarios, universal checks still add value — resource health, recent changes, dependency health, platform events — presented in a structured format.
-
-As AZ Doctor matures, services graduate from Layer 2 to Layer 1 by adding dedicated playbooks.
+**Layer 3** — For novel scenarios, universal checks (resource health, recent changes, dependency health) still provide structured diagnostic value.
 
 ## Auth
 
-All Azure API calls use `DefaultAzureCredential` from `@azure/identity`. Run `az login` before starting Copilot CLI — the MCP server inherits your CLI session automatically. No additional auth setup needed.
+All API calls use `DefaultAzureCredential` from `@azure/identity`. Just run `az login` — the MCP server inherits your session.
 
-**Minimum role:** Reader on the target subscription covers Resource Health, Activity Logs, Resource Graph, and Metrics. Log Analytics may require Log Analytics Reader. Use `azdoctor_check_permissions` to verify your access before investigating.
-
-## Local Development
-
-```bash
-cd server
-npm install
-npm run build
-```
-
-Test with MCP Inspector:
-
-```bash
-cd server
-npx @modelcontextprotocol/inspector node build/index.js
-```
-
-All 13 tools should appear and respond in the inspector.
+**Minimum role:** Reader on the target subscription. Log Analytics queries may need Log Analytics Reader. Run `azdoctor_check_permissions` to verify.
 
 ## Standalone MCP Server
 
-AZ Doctor works as a standalone MCP server with any MCP-compatible client (Claude Desktop, Cursor, VS Code, etc.), not just GitHub Copilot CLI.
-
-### Claude Desktop
-
-Add to your Claude Desktop MCP config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS or `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+AZ Doctor works with any MCP-compatible client, not just Copilot CLI. Add to your MCP config:
 
 ```json
 {
@@ -279,26 +288,13 @@ Add to your Claude Desktop MCP config (`~/Library/Application Support/Claude/cla
 }
 ```
 
-### Claude Code
+Works with Claude Desktop, Claude Code, Cursor, VS Code, and any other MCP client. The 18 tools work independently — agents and skills are Copilot CLI-specific.
 
-Add to your project's `.mcp.json` or global MCP config:
+**Config file locations:**
+- Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
+- Claude Code: `.mcp.json` in your project root or global config
 
-```json
-{
-  "mcpServers": {
-    "azdoctor": {
-      "command": "node",
-      "args": ["/path/to/azdoctor/server/build/index.js"]
-    }
-  }
-}
-```
-
-### Any MCP Client
-
-AZ Doctor uses STDIO transport. Point any MCP-compatible client at `node server/build/index.js`. The server exposes 18 tools that work independently of the Copilot CLI plugin layer (agents and skills are Copilot-specific).
-
-### Environment Variables
+## Configuration
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
@@ -309,6 +305,37 @@ AZ Doctor uses STDIO transport. Point any MCP-compatible client at `node server/
 | `AZDOCTOR_THRESHOLD_{TYPE}_CRITICAL` | Per-type critical override | — |
 
 Type shortcuts: `VM`, `SQL`, `APPSERVICE`, `REDIS`, `COSMOS`, `AKS`, `STORAGE`, `KEYVAULT`, `APIM`, `SERVICEBUS`, `EVENTHUB`, `POSTGRES`, `MYSQL`, `APPGW`, `LB`, `FIREWALL`, `CDN`, `COGNITIVE`, `SIGNALR`
+
+## Local Development
+
+```bash
+cd server
+npm install
+npm run build
+npm test
+```
+
+Test with MCP Inspector:
+
+```bash
+npx @modelcontextprotocol/inspector node build/index.js
+```
+
+## Updating
+
+**Windows (PowerShell):**
+```powershell
+cd "$env:USERPROFILE\.copilot\installed-plugins\_direct\ACES-AI-Garage--azdoctor"
+git pull && cd server && npm install --omit=dev
+```
+
+**macOS / Linux:**
+```bash
+cd ~/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor
+git pull && cd server && npm install --omit=dev
+```
+
+Then restart Copilot CLI.
 
 ## License
 
