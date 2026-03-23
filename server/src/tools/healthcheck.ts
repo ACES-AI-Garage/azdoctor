@@ -63,8 +63,8 @@ export function registerHealthcheck(server: McpServer): void {
           queryResourceGraph(
             [subscription],
             resourceGroup
-              ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Network/publicIPAddresses' and properties.ipConfiguration == '' | project id, name, type, location, resourceGroup`
-              : `Resources | where type =~ 'Microsoft.Network/publicIPAddresses' and properties.ipConfiguration == '' | project id, name, type, location, resourceGroup`
+              ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Network/publicIPAddresses' and (isnull(properties.ipConfiguration) or properties.ipConfiguration == '') | project id, name, type, location, resourceGroup`
+              : `Resources | where type =~ 'Microsoft.Network/publicIPAddresses' and (isnull(properties.ipConfiguration) or properties.ipConfiguration == '') | project id, name, type, location, resourceGroup`
           ),
           queryResourceGraph(
             [subscription],
@@ -78,9 +78,16 @@ export function registerHealthcheck(server: McpServer): void {
               ? `Resources | where resourceGroup =~ '${resourceGroup}' and (type =~ 'Microsoft.Sql/servers' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.DocumentDB/databaseAccounts') | project id, name, type, resourceGroup`
               : `Resources | where (type =~ 'Microsoft.Sql/servers' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.DocumentDB/databaseAccounts') | project id, name, type, resourceGroup`
           ),
+          // Empty App Service Plans (paid plans with no apps)
+          queryResourceGraph(
+            [subscription],
+            resourceGroup
+              ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Web/serverfarms' and properties.numberOfSites == 0 and sku.tier != 'Free' and sku.tier != 'Shared' | project id, name, type, location, resourceGroup, sku`
+              : `Resources | where type =~ 'Microsoft.Web/serverfarms' and properties.numberOfSites == 0 and sku.tier != 'Free' and sku.tier != 'Shared' | project id, name, type, location, resourceGroup, sku`
+          ),
         ]);
 
-      const [unattachedDisksResult, unassociatedIPsResult, classicResourcesResult, criticalResourcesResult] = rgCheckResults;
+      const [unattachedDisksResult, unassociatedIPsResult, classicResourcesResult, criticalResourcesResult, emptyPlansResult] = rgCheckResults;
 
       // Process Resource Health findings
       if (healthResult.error) {
@@ -209,10 +216,10 @@ export function registerHealthcheck(server: McpServer): void {
         for (const ip of unassociatedIPsResult.resources) {
           unassociatedIPCount++;
           findings.push({
-            severity: "info",
+            severity: "warning",
             resource: String(ip.name ?? "unknown"),
             resourceType: "Microsoft.Network/publicIPAddresses",
-            issue: `Public IP address is not associated with any resource.`,
+            issue: `Public IP address is not associated with any resource — incurring cost with no use.`,
             evidence: {
               id: ip.id,
               location: ip.location,
@@ -269,6 +276,30 @@ export function registerHealthcheck(server: McpServer): void {
         }
       }
 
+      // Empty App Service Plans
+      let emptyPlanCount = 0;
+      if (emptyPlansResult.error) {
+        errors.push(emptyPlansResult.error);
+      } else {
+        for (const plan of emptyPlansResult.resources) {
+          emptyPlanCount++;
+          findings.push({
+            severity: "warning",
+            resource: String(plan.name ?? "unknown"),
+            resourceType: "Microsoft.Web/serverfarms",
+            issue: `Paid App Service Plan with no apps deployed — incurring cost with no workload.`,
+            evidence: {
+              id: plan.id,
+              location: plan.location,
+              resourceGroup: plan.resourceGroup,
+              sku: plan.sku,
+            },
+            recommendation:
+              "Delete the empty plan if no longer needed, or deploy an app to it.",
+          });
+        }
+      }
+
       // 4. Filter by severity threshold
       const severityRank: Record<string, number> = {
         critical: 3,
@@ -296,7 +327,8 @@ export function registerHealthcheck(server: McpServer): void {
           infoCount * 2 +
           unattachedDiskCount * 3 +
           classicResourceCount * 5 +
-          unassociatedIPCount * 2
+          unassociatedIPCount * 3 +
+          emptyPlanCount * 3
       );
 
       const healthyCount = Math.max(0, scannedResources - criticalCount - warningCount);

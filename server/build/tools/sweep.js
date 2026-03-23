@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { execSync } from "node:child_process";
-import { batchExecute, queryResourceGraph, batchResourceHealth, getActivityLogs, } from "../utils/azure-client.js";
+import { batchExecute, queryResourceGraph, getActivityLogs, } from "../utils/azure-client.js";
 export function registerSweep(server) {
     server.tool("azdoctor_sweep", "Scan all accessible Azure subscriptions for health issues. Ranks subscriptions by risk score for a portfolio-wide view.", {
         severity: z
@@ -61,38 +61,34 @@ export function registerSweep(server) {
         catch {
             // Names are optional; proceed without them
         }
-        // 2. For each subscription, run a lightweight health scan (batched, max 5 concurrent)
+        // 2. For each subscription, run a lightweight health scan (batched, max 3 concurrent)
+        // Use a per-subscription timeout to avoid one slow sub blocking everything
+        const PER_SUB_TIMEOUT = 20000; // 20 seconds per subscription
+        function withTimeout(promise, ms, fallback) {
+            return Promise.race([
+                promise,
+                new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
+            ]);
+        }
         const scanTasks = subscriptionIds.map((subId) => async () => {
             const subErrors = [];
             let totalResources = 0;
             let critical = 0;
             let warning = 0;
-            // Resource Graph: count resources by type
-            const rgResult = await queryResourceGraph([subId], "Resources | summarize count()");
+            // Run Resource Graph and Activity Logs in parallel (skip Resource Health — too slow for sweep)
+            const [rgResult, activityResult] = await withTimeout(Promise.all([
+                queryResourceGraph([subId], "Resources | summarize total=count() | extend unhealthy=0"),
+                getActivityLogs(subId, 24),
+            ]), PER_SUB_TIMEOUT, [
+                { resources: [], totalRecords: 0, error: { code: "TIMEOUT", message: "Resource Graph scan timed out" } },
+                { events: [], error: { code: "TIMEOUT", message: "Activity Log scan timed out" } },
+            ]);
             if (rgResult.error) {
                 subErrors.push(rgResult.error);
             }
             else if (rgResult.resources.length > 0) {
-                totalResources = rgResult.resources[0]["count_"] ?? 0;
+                totalResources = rgResult.resources[0]["total"] ?? 0;
             }
-            // Batch Resource Health: count unavailable/degraded
-            const healthResult = await batchResourceHealth(subId);
-            if (healthResult.error) {
-                subErrors.push(healthResult.error);
-            }
-            else {
-                for (const status of healthResult.statuses) {
-                    const state = status.properties?.availabilityState;
-                    if (state === "Unavailable") {
-                        critical++;
-                    }
-                    else if (state === "Degraded") {
-                        critical++;
-                    }
-                }
-            }
-            // Activity Logs (last 24h): count failed operations
-            const activityResult = await getActivityLogs(subId, 24);
             if (activityResult.error) {
                 subErrors.push(activityResult.error);
             }
@@ -102,6 +98,11 @@ export function registerSweep(server) {
                         warning++;
                     }
                 }
+            }
+            // Quick Resource Graph check for unhealthy resources (faster than Resource Health API)
+            const unhealthyResult = await withTimeout(queryResourceGraph([subId], "ResourceHealthResources | where properties.availabilityState != 'Available' | summarize critical=count()"), 10000, { resources: [], totalRecords: 0, error: undefined });
+            if (!unhealthyResult.error && unhealthyResult.resources.length > 0) {
+                critical = unhealthyResult.resources[0]["critical"] ?? 0;
             }
             // Calculate risk score
             const riskScore = Math.min(100, critical * 30 + warning * 10);
@@ -115,7 +116,7 @@ export function registerSweep(server) {
                 errors: subErrors,
             };
         });
-        const scanResults = await batchExecute(scanTasks, 5);
+        const scanResults = await batchExecute(scanTasks, 3);
         // 3. Collect all sub-level errors
         for (const result of scanResults) {
             errors.push(...result.errors);

@@ -311,7 +311,7 @@ function registerHealthcheck(server2) {
         ),
         queryResourceGraph(
           [subscription],
-          resourceGroup ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Network/publicIPAddresses' and properties.ipConfiguration == '' | project id, name, type, location, resourceGroup` : `Resources | where type =~ 'Microsoft.Network/publicIPAddresses' and properties.ipConfiguration == '' | project id, name, type, location, resourceGroup`
+          resourceGroup ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Network/publicIPAddresses' and (isnull(properties.ipConfiguration) or properties.ipConfiguration == '') | project id, name, type, location, resourceGroup` : `Resources | where type =~ 'Microsoft.Network/publicIPAddresses' and (isnull(properties.ipConfiguration) or properties.ipConfiguration == '') | project id, name, type, location, resourceGroup`
         ),
         queryResourceGraph(
           [subscription],
@@ -320,9 +320,14 @@ function registerHealthcheck(server2) {
         queryResourceGraph(
           [subscription],
           resourceGroup ? `Resources | where resourceGroup =~ '${resourceGroup}' and (type =~ 'Microsoft.Sql/servers' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.DocumentDB/databaseAccounts') | project id, name, type, resourceGroup` : `Resources | where (type =~ 'Microsoft.Sql/servers' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.DocumentDB/databaseAccounts') | project id, name, type, resourceGroup`
+        ),
+        // Empty App Service Plans (paid plans with no apps)
+        queryResourceGraph(
+          [subscription],
+          resourceGroup ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Web/serverfarms' and properties.numberOfSites == 0 and sku.tier != 'Free' and sku.tier != 'Shared' | project id, name, type, location, resourceGroup, sku` : `Resources | where type =~ 'Microsoft.Web/serverfarms' and properties.numberOfSites == 0 and sku.tier != 'Free' and sku.tier != 'Shared' | project id, name, type, location, resourceGroup, sku`
         )
       ]);
-      const [unattachedDisksResult, unassociatedIPsResult, classicResourcesResult, criticalResourcesResult] = rgCheckResults;
+      const [unattachedDisksResult, unassociatedIPsResult, classicResourcesResult, criticalResourcesResult, emptyPlansResult] = rgCheckResults;
       if (healthResult.error) {
         errors.push(healthResult.error);
       } else {
@@ -424,10 +429,10 @@ function registerHealthcheck(server2) {
         for (const ip of unassociatedIPsResult.resources) {
           unassociatedIPCount++;
           findings.push({
-            severity: "info",
+            severity: "warning",
             resource: String(ip.name ?? "unknown"),
             resourceType: "Microsoft.Network/publicIPAddresses",
-            issue: `Public IP address is not associated with any resource.`,
+            issue: `Public IP address is not associated with any resource \u2014 incurring cost with no use.`,
             evidence: {
               id: ip.id,
               location: ip.location,
@@ -476,6 +481,27 @@ function registerHealthcheck(server2) {
           });
         }
       }
+      let emptyPlanCount = 0;
+      if (emptyPlansResult.error) {
+        errors.push(emptyPlansResult.error);
+      } else {
+        for (const plan of emptyPlansResult.resources) {
+          emptyPlanCount++;
+          findings.push({
+            severity: "warning",
+            resource: String(plan.name ?? "unknown"),
+            resourceType: "Microsoft.Web/serverfarms",
+            issue: `Paid App Service Plan with no apps deployed \u2014 incurring cost with no workload.`,
+            evidence: {
+              id: plan.id,
+              location: plan.location,
+              resourceGroup: plan.resourceGroup,
+              sku: plan.sku
+            },
+            recommendation: "Delete the empty plan if no longer needed, or deploy an app to it."
+          });
+        }
+      }
       const severityRank = {
         critical: 3,
         warning: 2,
@@ -494,7 +520,7 @@ function registerHealthcheck(server2) {
       const infoCount = filtered.filter((f) => f.severity === "info").length;
       const riskScore = Math.min(
         100,
-        criticalCount * 30 + warningCount * 10 + infoCount * 2 + unattachedDiskCount * 3 + classicResourceCount * 5 + unassociatedIPCount * 2
+        criticalCount * 30 + warningCount * 10 + infoCount * 2 + unattachedDiskCount * 3 + classicResourceCount * 5 + unassociatedIPCount * 3 + emptyPlanCount * 3
       );
       const healthyCount = Math.max(0, scannedResources - criticalCount - warningCount);
       const response = {
@@ -4346,35 +4372,38 @@ function registerSweep(server2) {
         }
       } catch {
       }
+      const PER_SUB_TIMEOUT = 2e4;
+      function withTimeout2(promise, ms, fallback) {
+        return Promise.race([
+          promise,
+          new Promise((resolve) => setTimeout(() => resolve(fallback), ms))
+        ]);
+      }
       const scanTasks = subscriptionIds.map(
         (subId) => async () => {
           const subErrors = [];
           let totalResources = 0;
           let critical = 0;
           let warning = 0;
-          const rgResult = await queryResourceGraph(
-            [subId],
-            "Resources | summarize count()"
+          const [rgResult, activityResult] = await withTimeout2(
+            Promise.all([
+              queryResourceGraph(
+                [subId],
+                "Resources | summarize total=count() | extend unhealthy=0"
+              ),
+              getActivityLogs(subId, 24)
+            ]),
+            PER_SUB_TIMEOUT,
+            [
+              { resources: [], totalRecords: 0, error: { code: "TIMEOUT", message: "Resource Graph scan timed out" } },
+              { events: [], error: { code: "TIMEOUT", message: "Activity Log scan timed out" } }
+            ]
           );
           if (rgResult.error) {
             subErrors.push(rgResult.error);
           } else if (rgResult.resources.length > 0) {
-            totalResources = rgResult.resources[0]["count_"] ?? 0;
+            totalResources = rgResult.resources[0]["total"] ?? 0;
           }
-          const healthResult = await batchResourceHealth(subId);
-          if (healthResult.error) {
-            subErrors.push(healthResult.error);
-          } else {
-            for (const status of healthResult.statuses) {
-              const state = status.properties?.availabilityState;
-              if (state === "Unavailable") {
-                critical++;
-              } else if (state === "Degraded") {
-                critical++;
-              }
-            }
-          }
-          const activityResult = await getActivityLogs(subId, 24);
           if (activityResult.error) {
             subErrors.push(activityResult.error);
           } else {
@@ -4383,6 +4412,17 @@ function registerSweep(server2) {
                 warning++;
               }
             }
+          }
+          const unhealthyResult = await withTimeout2(
+            queryResourceGraph(
+              [subId],
+              "ResourceHealthResources | where properties.availabilityState != 'Available' | summarize critical=count()"
+            ),
+            1e4,
+            { resources: [], totalRecords: 0, error: void 0 }
+          );
+          if (!unhealthyResult.error && unhealthyResult.resources.length > 0) {
+            critical = unhealthyResult.resources[0]["critical"] ?? 0;
           }
           const riskScore = Math.min(100, critical * 30 + warning * 10);
           return {
@@ -4396,7 +4436,7 @@ function registerSweep(server2) {
           };
         }
       );
-      const scanResults = await batchExecute(scanTasks, 5);
+      const scanResults = await batchExecute(scanTasks, 3);
       for (const result of scanResults) {
         errors.push(...result.errors);
       }
