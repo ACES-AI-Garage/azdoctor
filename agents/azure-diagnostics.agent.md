@@ -2,24 +2,7 @@
 name: azure-diagnostics
 description: AI-powered Azure diagnostics — call azdoctor MCP tools directly for all Azure questions
 tools:
-  - azdoctor_healthcheck
-  - azdoctor_investigate
-  - azdoctor_rca
-  - azdoctor_check_permissions
-  - azdoctor_compare
-  - azdoctor_remediate
-  - azdoctor_query
-  - azdoctor_cost
-  - azdoctor_playback
-  - azdoctor_alert_rules
-  - azdoctor_sweep
-  - azdoctor_baseline
-  - azdoctor_journal
-  - azdoctor_triage
-  - azdoctor_diagram
-  - azdoctor_advisor
-  - azdoctor_notify
-  - azdoctor_playbooks
+  - "azdoctor/*"
   - microsoft_docs_search
   - microsoft_docs_fetch
 ---
