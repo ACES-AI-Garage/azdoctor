@@ -7,10 +7,5 @@
   "keywords": ["azure", "diagnostics", "troubleshooting", "support", "rca"],
   "agents": "agents/",
   "skills": ["skills/"],
-  "mcpServers": {
-    "azdoctor": {
-      "command": "node",
-      "args": ["./server/build/index.js"]
-    }
-  }
+  "mcpServers": ".mcp.json"
 }
