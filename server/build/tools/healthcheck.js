@@ -1,7 +1,18 @@
 import { z } from "zod";
 import { resolveSubscription, queryResourceGraph, batchResourceHealth, getActivityLogs, } from "../utils/azure-client.js";
+// Map Advisor impact to our severity levels
+function advisorImpactToSeverity(impact) {
+    switch (impact.toLowerCase()) {
+        case "high":
+            return "critical";
+        case "medium":
+            return "warning";
+        default:
+            return "info";
+    }
+}
 export function registerHealthcheck(server) {
-    server.tool("azdoctor_healthcheck", "Scan a subscription or resource group for health issues, anomalies, and risks. Returns a risk-scored summary of findings across all resources.", {
+    server.tool("azdoctor_healthcheck", "Scan a subscription or resource group for health issues, Azure Advisor recommendations, and operational risks. Returns a risk-scored summary powered by Resource Health, Azure Advisor, and Activity Logs.", {
         subscription: z.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
         resourceGroup: z
             .string()
@@ -15,40 +26,49 @@ export function registerHealthcheck(server) {
         const subscription = await resolveSubscription(subParam);
         const findings = [];
         const errors = [];
-        // 1. Query Resource Graph for all resources in scope
-        const rgQuery = resourceGroup
-            ? `Resources | where resourceGroup =~ '${resourceGroup}' | project id, name, type, location, resourceGroup`
-            : `Resources | project id, name, type, location, resourceGroup`;
-        const resourceList = await queryResourceGraph([subscription], rgQuery);
-        if (resourceList.error)
-            errors.push(resourceList.error);
-        const scannedResources = resourceList.totalRecords;
-        // 2. Run health checks, activity log checks, and Resource Graph misconfiguration checks in parallel
-        const [healthResult, activityResult, ...rgCheckResults] = await Promise.all([
-            // Health check
+        // 1. Count resources in scope
+        const rgCountQuery = resourceGroup
+            ? `Resources | where resourceGroup =~ '${resourceGroup}' | summarize count()`
+            : `Resources | summarize count()`;
+        const resourceCountResult = await queryResourceGraph([subscription], rgCountQuery);
+        if (resourceCountResult.error)
+            errors.push(resourceCountResult.error);
+        const scannedResources = resourceCountResult.resources.length > 0
+            ? resourceCountResult.resources[0]["count_"] ?? 0
+            : 0;
+        // 2. Run Resource Health, Activity Logs, and Advisor in parallel
+        const advisorQuery = resourceGroup
+            ? [
+                "advisorresources",
+                "| where type == 'microsoft.advisor/recommendations'",
+                `| where resourceGroup =~ '${resourceGroup}'`,
+                "| project id, name, resourceGroup,",
+                "    category = properties.category,",
+                "    impact = properties.impact,",
+                "    problem = properties.shortDescription.problem,",
+                "    solution = properties.shortDescription.solution,",
+                "    affectedResource = properties.impactedValue,",
+                "    affectedResourceType = properties.impactedField,",
+                "    lastUpdated = properties.lastUpdated",
+            ].join("\n")
+            : [
+                "advisorresources",
+                "| where type == 'microsoft.advisor/recommendations'",
+                "| project id, name, resourceGroup,",
+                "    category = properties.category,",
+                "    impact = properties.impact,",
+                "    problem = properties.shortDescription.problem,",
+                "    solution = properties.shortDescription.solution,",
+                "    affectedResource = properties.impactedValue,",
+                "    affectedResourceType = properties.impactedField,",
+                "    lastUpdated = properties.lastUpdated",
+            ].join("\n");
+        const [healthResult, activityResult, advisorResult] = await Promise.all([
             batchResourceHealth(subscription, resourceGroup),
-            // Activity logs
             getActivityLogs(subscription, 24, undefined, resourceGroup),
-            // Resource Graph checks for common misconfigurations
-            queryResourceGraph([subscription], resourceGroup
-                ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Compute/disks' and properties.diskState == 'Unattached' | project id, name, type, location, resourceGroup`
-                : `Resources | where type =~ 'Microsoft.Compute/disks' and properties.diskState == 'Unattached' | project id, name, type, location, resourceGroup`),
-            queryResourceGraph([subscription], resourceGroup
-                ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Network/publicIPAddresses' and (isnull(properties.ipConfiguration) or properties.ipConfiguration == '') | project id, name, type, location, resourceGroup`
-                : `Resources | where type =~ 'Microsoft.Network/publicIPAddresses' and (isnull(properties.ipConfiguration) or properties.ipConfiguration == '') | project id, name, type, location, resourceGroup`),
-            queryResourceGraph([subscription], resourceGroup
-                ? `Resources | where resourceGroup =~ '${resourceGroup}' and (type startswith 'Microsoft.ClassicCompute' or type startswith 'Microsoft.ClassicNetwork' or type startswith 'Microsoft.ClassicStorage') | project id, name, type, location, resourceGroup`
-                : `Resources | where type startswith 'Microsoft.ClassicCompute' or type startswith 'Microsoft.ClassicNetwork' or type startswith 'Microsoft.ClassicStorage' | project id, name, type, location, resourceGroup`),
-            queryResourceGraph([subscription], resourceGroup
-                ? `Resources | where resourceGroup =~ '${resourceGroup}' and (type =~ 'Microsoft.Sql/servers' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.DocumentDB/databaseAccounts') | project id, name, type, resourceGroup`
-                : `Resources | where (type =~ 'Microsoft.Sql/servers' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.DocumentDB/databaseAccounts') | project id, name, type, resourceGroup`),
-            // Empty App Service Plans (paid plans with no apps)
-            queryResourceGraph([subscription], resourceGroup
-                ? `Resources | where resourceGroup =~ '${resourceGroup}' and type =~ 'Microsoft.Web/serverfarms' and properties.numberOfSites == 0 and sku.tier != 'Free' and sku.tier != 'Shared' | project id, name, type, location, resourceGroup, sku`
-                : `Resources | where type =~ 'Microsoft.Web/serverfarms' and properties.numberOfSites == 0 and sku.tier != 'Free' and sku.tier != 'Shared' | project id, name, type, location, resourceGroup, sku`),
+            queryResourceGraph([subscription], advisorQuery),
         ]);
-        const [unattachedDisksResult, unassociatedIPsResult, classicResourcesResult, criticalResourcesResult, emptyPlansResult] = rgCheckResults;
-        // Process Resource Health findings
+        // 3. Process Resource Health findings
         if (healthResult.error) {
             errors.push(healthResult.error);
         }
@@ -62,6 +82,7 @@ export function registerHealthcheck(server) {
                         severity: "critical",
                         resource: resourceName,
                         resourceType,
+                        category: "Resource Health",
                         issue: `Resource is unavailable: ${status.properties?.summary ?? "No details"}`,
                         evidence: {
                             availabilityState: state,
@@ -77,6 +98,7 @@ export function registerHealthcheck(server) {
                         severity: "critical",
                         resource: resourceName,
                         resourceType,
+                        category: "Resource Health",
                         issue: `Resource is degraded: ${status.properties?.summary ?? "No details"}`,
                         evidence: {
                             availabilityState: state,
@@ -87,26 +109,23 @@ export function registerHealthcheck(server) {
                 }
             }
         }
-        // Process Activity Log findings
+        // 4. Process Activity Log findings
         if (activityResult.error) {
             errors.push(activityResult.error);
         }
         else {
-            // Count changes per resource
             const changesByResource = new Map();
-            let failedDeployments = 0;
             for (const event of activityResult.events) {
                 const resId = event.resourceId ?? "unknown";
                 changesByResource.set(resId, (changesByResource.get(resId) ?? 0) + 1);
-                // Flag failed deployments
                 if (event.status?.value === "Failed" &&
                     event.operationName?.value?.includes("deployments")) {
-                    failedDeployments++;
                     const resourceName = event.resourceId?.split("/").pop() ?? "unknown";
                     findings.push({
                         severity: "warning",
                         resource: resourceName,
                         resourceType: "Microsoft.Resources/deployments",
+                        category: "Activity Log",
                         issue: `Failed deployment: ${event.operationName?.localizedValue ?? event.operationName?.value ?? "unknown operation"}`,
                         evidence: {
                             status: event.status?.value,
@@ -117,7 +136,6 @@ export function registerHealthcheck(server) {
                     });
                 }
             }
-            // Flag high change velocity (> 20 changes on a single resource in 24h)
             for (const [resId, count] of changesByResource) {
                 if (count > 20) {
                     const resourceName = resId.split("/").pop() ?? "unknown";
@@ -125,6 +143,7 @@ export function registerHealthcheck(server) {
                         severity: "warning",
                         resource: resourceName,
                         resourceType: "unknown",
+                        category: "Activity Log",
                         issue: `High change velocity: ${count} changes in last 24h`,
                         evidence: { changeCount: count, resourceId: resId },
                         recommendation: "Review whether repeated changes indicate a flapping deployment or configuration drift.",
@@ -132,118 +151,36 @@ export function registerHealthcheck(server) {
                 }
             }
         }
-        // Process Resource Graph misconfiguration findings
-        // Unattached disks
-        let unattachedDiskCount = 0;
-        if (unattachedDisksResult.error) {
-            errors.push(unattachedDisksResult.error);
+        // 5. Process Azure Advisor recommendations
+        if (advisorResult.error) {
+            errors.push(advisorResult.error);
         }
         else {
-            for (const disk of unattachedDisksResult.resources) {
-                unattachedDiskCount++;
+            for (const rec of advisorResult.resources) {
+                const impact = String(rec["impact"] ?? "Low");
+                const category = String(rec["category"] ?? "Unknown");
+                const problem = String(rec["problem"] ?? "");
+                const solution = String(rec["solution"] ?? "");
+                const affectedResource = String(rec["affectedResource"] ?? "unknown");
+                const affectedResourceType = String(rec["affectedResourceType"] ?? "unknown");
+                const resourceGroupName = String(rec["resourceGroup"] ?? "");
                 findings.push({
-                    severity: "warning",
-                    resource: String(disk.name ?? "unknown"),
-                    resourceType: "Microsoft.Compute/disks",
-                    issue: `Unattached managed disk detected — incurring cost without being used.`,
+                    severity: advisorImpactToSeverity(impact),
+                    resource: affectedResource,
+                    resourceType: affectedResourceType,
+                    category: `Advisor — ${category}`,
+                    issue: problem || `${category} recommendation`,
                     evidence: {
-                        id: disk.id,
-                        location: disk.location,
-                        resourceGroup: disk.resourceGroup,
+                        advisorCategory: category,
+                        impact,
+                        resourceGroup: resourceGroupName,
+                        lastUpdated: rec["lastUpdated"],
                     },
-                    recommendation: "Delete the disk if no longer needed, or reattach it to a VM to avoid wasted cost.",
+                    recommendation: solution || "Review this recommendation in Azure Advisor.",
                 });
             }
         }
-        // Unassociated Public IPs
-        let unassociatedIPCount = 0;
-        if (unassociatedIPsResult.error) {
-            errors.push(unassociatedIPsResult.error);
-        }
-        else {
-            for (const ip of unassociatedIPsResult.resources) {
-                unassociatedIPCount++;
-                findings.push({
-                    severity: "warning",
-                    resource: String(ip.name ?? "unknown"),
-                    resourceType: "Microsoft.Network/publicIPAddresses",
-                    issue: `Public IP address is not associated with any resource — incurring cost with no use.`,
-                    evidence: {
-                        id: ip.id,
-                        location: ip.location,
-                        resourceGroup: ip.resourceGroup,
-                    },
-                    recommendation: "Review whether this public IP is still needed. Unassociated public IPs may pose a security risk and incur cost.",
-                });
-            }
-        }
-        // Classic resources
-        let classicResourceCount = 0;
-        if (classicResourcesResult.error) {
-            errors.push(classicResourcesResult.error);
-        }
-        else {
-            for (const res of classicResourcesResult.resources) {
-                classicResourceCount++;
-                findings.push({
-                    severity: "warning",
-                    resource: String(res.name ?? "unknown"),
-                    resourceType: String(res.type ?? "Microsoft.Classic*"),
-                    issue: `Classic (ASM) resource detected — this deployment model is deprecated.`,
-                    evidence: {
-                        id: res.id,
-                        type: res.type,
-                        location: res.location,
-                        resourceGroup: res.resourceGroup,
-                    },
-                    recommendation: "Migrate to Azure Resource Manager (ARM). Classic resources will be retired. See https://aka.ms/classicresourcemigration.",
-                });
-            }
-        }
-        // Critical resources without locks
-        if (criticalResourcesResult.error) {
-            errors.push(criticalResourcesResult.error);
-        }
-        else {
-            for (const res of criticalResourcesResult.resources) {
-                findings.push({
-                    severity: "info",
-                    resource: String(res.name ?? "unknown"),
-                    resourceType: String(res.type ?? "unknown"),
-                    issue: `Critical resource type detected — review whether resource locks are configured.`,
-                    evidence: {
-                        id: res.id,
-                        type: res.type,
-                        resourceGroup: res.resourceGroup,
-                    },
-                    recommendation: "Consider adding a CanNotDelete or ReadOnly lock to protect this critical resource from accidental deletion or modification.",
-                });
-            }
-        }
-        // Empty App Service Plans
-        let emptyPlanCount = 0;
-        if (emptyPlansResult.error) {
-            errors.push(emptyPlansResult.error);
-        }
-        else {
-            for (const plan of emptyPlansResult.resources) {
-                emptyPlanCount++;
-                findings.push({
-                    severity: "warning",
-                    resource: String(plan.name ?? "unknown"),
-                    resourceType: "Microsoft.Web/serverfarms",
-                    issue: `Paid App Service Plan with no apps deployed — incurring cost with no workload.`,
-                    evidence: {
-                        id: plan.id,
-                        location: plan.location,
-                        resourceGroup: plan.resourceGroup,
-                        sku: plan.sku,
-                    },
-                    recommendation: "Delete the empty plan if no longer needed, or deploy an app to it.",
-                });
-            }
-        }
-        // 4. Filter by severity threshold
+        // 6. Filter by severity threshold
         const severityRank = {
             critical: 3,
             warning: 2,
@@ -251,21 +188,24 @@ export function registerHealthcheck(server) {
         };
         const minRank = severityRank[severity] ?? 2;
         const filtered = findings.filter((f) => (severityRank[f.severity] ?? 0) >= minRank);
-        // 5. Calculate risk score (0-100)
+        // 7. Calculate risk score (0-100)
         const criticalCount = filtered.filter((f) => f.severity === "critical").length;
         const warningCount = filtered.filter((f) => f.severity === "warning").length;
         const infoCount = filtered.filter((f) => f.severity === "info").length;
-        const riskScore = Math.min(100, criticalCount * 30 +
-            warningCount * 10 +
-            infoCount * 2 +
-            unattachedDiskCount * 3 +
-            classicResourceCount * 5 +
-            unassociatedIPCount * 3 +
-            emptyPlanCount * 3);
+        const riskScore = Math.min(100, criticalCount * 25 + warningCount * 8 + infoCount * 2);
         const healthyCount = Math.max(0, scannedResources - criticalCount - warningCount);
+        // 8. Group findings by source for summary
+        const advisorCount = filtered.filter((f) => f.category?.startsWith("Advisor")).length;
+        const healthCount = filtered.filter((f) => f.category === "Resource Health").length;
+        const activityCount = filtered.filter((f) => f.category === "Activity Log").length;
         const response = {
             riskScore,
             summary: `${criticalCount} critical, ${warningCount} warning, ${healthyCount} healthy`,
+            sources: {
+                resourceHealth: healthCount,
+                azureAdvisor: advisorCount,
+                activityLog: activityCount,
+            },
             findings: filtered,
             scannedResources,
             timestamp: new Date().toISOString(),
