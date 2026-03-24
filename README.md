@@ -14,11 +14,13 @@ Ask a question in natural language, get a structured diagnosis backed by live Az
 
 ### Install
 
+**Step 1:** Install the plugin in Copilot CLI:
+
 ```
 /plugin install ACES-AI-Garage/azdoctor
 ```
 
-Then install the MCP server dependencies:
+**Step 2:** Install the MCP server dependencies:
 
 **Windows (PowerShell):**
 ```powershell
@@ -32,11 +34,51 @@ cd ~/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor/server
 npm install --omit=dev
 ```
 
-Restart Copilot CLI. Verify with `/mcp show azdoctor` — you should see 18 tools.
+**Step 3:** Register the MCP server. Due to a [Copilot CLI bug](https://github.com/github/copilot-cli/issues/693), plugin MCP servers don't auto-register. Add manually:
+
+**Windows** — create/edit `%USERPROFILE%\.copilot\mcp-config.json`:
+```json
+{
+  "mcpServers": {
+    "azdoctor": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["C:/Users/YOUR_USERNAME/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor/server/build/index.js"]
+    }
+  }
+}
+```
+
+**macOS / Linux** — create/edit `~/.copilot/mcp-config.json`:
+```json
+{
+  "mcpServers": {
+    "azdoctor": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["~/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor/server/build/index.js"]
+    }
+  }
+}
+```
+
+> Replace `YOUR_USERNAME` with your actual username on Windows.
+
+**Step 4:** Restart Copilot CLI and verify:
+
+```
+/mcp show azdoctor
+```
+
+You should see 18 tools. If the server shows "Connecting" indefinitely, check that the path in step 3 is correct and that `npm install` completed in step 2.
 
 ## Usage
 
-Talk to the `@azure-diagnostics` agent in natural language. Here's what it looks like in practice:
+Ask Copilot CLI in natural language — the MCP tools are picked up automatically. You can also use the skill shortcuts `/healthcheck`, `/diagnose`, `/rca`, and `/compare`.
+
+> **Note:** The `@azure-diagnostics` agent is included but currently non-functional due to a [Copilot CLI bug (#693)](https://github.com/github/copilot-cli/issues/693) where agents can't access MCP tools. Just ask directly without the `@` prefix — it works the same way.
+
+Here's what it looks like in practice:
 
 ---
 
