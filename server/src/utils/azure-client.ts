@@ -1,24 +1,26 @@
 import { execSync } from "node:child_process";
-import { DefaultAzureCredential } from "@azure/identity";
-import type { TokenCredential } from "@azure/identity";
-import {
-  ResourceGraphClient,
-  ResourceGraphModels,
-} from "@azure/arm-resourcegraph";
-import { MicrosoftResourceHealth } from "@azure/arm-resourcehealth";
-import type { AvailabilityStatus } from "@azure/arm-resourcehealth";
-import { MonitorClient } from "@azure/arm-monitor";
-import type { EventData } from "@azure/arm-monitor";
-import { LogsQueryClient, MetricsQueryClient } from "@azure/monitor-query";
-import type { MetricsQueryResult } from "@azure/monitor-query";
-import { MicrosoftSupport } from "@azure/arm-support";
+
+// Lazy-load Azure SDK modules to keep MCP server startup fast.
+// These are only imported when a tool is actually invoked.
+type TokenCredential = import("@azure/identity").TokenCredential;
+type ResourceGraphClient = import("@azure/arm-resourcegraph").ResourceGraphClient;
+type QueryRequest = import("@azure/arm-resourcegraph").ResourceGraphModels.QueryRequest;
+type MicrosoftResourceHealth = import("@azure/arm-resourcehealth").MicrosoftResourceHealth;
+type AvailabilityStatus = import("@azure/arm-resourcehealth").AvailabilityStatus;
+type MonitorClient = import("@azure/arm-monitor").MonitorClient;
+type EventData = import("@azure/arm-monitor").EventData;
+type LogsQueryClient = import("@azure/monitor-query").LogsQueryClient;
+type MetricsQueryClient = import("@azure/monitor-query").MetricsQueryClient;
+type MetricsQueryResult = import("@azure/monitor-query").MetricsQueryResult;
+type MicrosoftSupport = import("@azure/arm-support").MicrosoftSupport;
 
 // ─── Shared credential ──────────────────────────────────────────────
 
 let credentialInstance: TokenCredential | null = null;
 
-export function getCredential(): TokenCredential {
+export async function getCredential(): Promise<TokenCredential> {
   if (!credentialInstance) {
+    const { DefaultAzureCredential } = await import("@azure/identity");
     credentialInstance = new DefaultAzureCredential();
   }
   return credentialInstance;
@@ -137,30 +139,36 @@ async function withRetry<T>(
 
 // ─── Client factories ────────────────────────────────────────────────
 
-export function createResourceGraphClient(): ResourceGraphClient {
-  return new ResourceGraphClient(getCredential());
+export async function createResourceGraphClient(): Promise<ResourceGraphClient> {
+  const { ResourceGraphClient } = await import("@azure/arm-resourcegraph");
+  return new ResourceGraphClient(await getCredential());
 }
 
-export function createResourceHealthClient(
+export async function createResourceHealthClient(
   subscriptionId: string
-): MicrosoftResourceHealth {
-  return new MicrosoftResourceHealth(getCredential(), subscriptionId);
+): Promise<MicrosoftResourceHealth> {
+  const { MicrosoftResourceHealth } = await import("@azure/arm-resourcehealth");
+  return new MicrosoftResourceHealth(await getCredential(), subscriptionId);
 }
 
-export function createMonitorClient(subscriptionId: string): MonitorClient {
-  return new MonitorClient(getCredential(), subscriptionId);
+export async function createMonitorClient(subscriptionId: string): Promise<MonitorClient> {
+  const { MonitorClient } = await import("@azure/arm-monitor");
+  return new MonitorClient(await getCredential(), subscriptionId);
 }
 
-export function createLogsQueryClient(): LogsQueryClient {
-  return new LogsQueryClient(getCredential());
+export async function createLogsQueryClient(): Promise<LogsQueryClient> {
+  const { LogsQueryClient } = await import("@azure/monitor-query");
+  return new LogsQueryClient(await getCredential());
 }
 
-export function createMetricsQueryClient(): MetricsQueryClient {
-  return new MetricsQueryClient(getCredential());
+export async function createMetricsQueryClient(): Promise<MetricsQueryClient> {
+  const { MetricsQueryClient } = await import("@azure/monitor-query");
+  return new MetricsQueryClient(await getCredential());
 }
 
-export function createSupportClient(subscriptionId: string): MicrosoftSupport {
-  return new MicrosoftSupport(getCredential(), subscriptionId);
+export async function createSupportClient(subscriptionId: string): Promise<MicrosoftSupport> {
+  const { MicrosoftSupport } = await import("@azure/arm-support");
+  return new MicrosoftSupport(await getCredential(), subscriptionId);
 }
 
 // ─── Resource Graph ──────────────────────────────────────────────────
@@ -197,8 +205,8 @@ export async function queryResourceGraph(
   }
 
   try {
-    const client = createResourceGraphClient();
-    const request: ResourceGraphModels.QueryRequest = {
+    const client = await createResourceGraphClient();
+    const request: QueryRequest = {
       subscriptions,
       query,
       options: { resultFormat: "objectArray" },
@@ -212,7 +220,7 @@ export async function queryResourceGraph(
     let skipToken = response.skipToken;
     let page = 1;
     while (skipToken && page < MAX_PAGES) {
-      const pagedRequest: ResourceGraphModels.QueryRequest = {
+      const pagedRequest: QueryRequest = {
         subscriptions,
         query,
         options: { resultFormat: "objectArray", skipToken },
@@ -258,7 +266,7 @@ export async function getResourceDiagnosticSettings(
   resourceUri: string
 ): Promise<{ settings: DiagnosticSettingInfo[]; error?: AzureError }> {
   try {
-    const client = createMonitorClient(subscriptionId);
+    const client = await createMonitorClient(subscriptionId);
     const response = await withRetry(() =>
       client.diagnosticSettings.list(resourceUri)
     );
@@ -295,7 +303,7 @@ export async function getResourceHealth(
   resourceUri: string
 ): Promise<HealthResult> {
   try {
-    const client = createResourceHealthClient(subscriptionId);
+    const client = await createResourceHealthClient(subscriptionId);
     const status = await withRetry(() =>
       client.availabilityStatuses.getByResource(resourceUri)
     );
@@ -310,7 +318,7 @@ export async function batchResourceHealth(
   resourceGroup?: string
 ): Promise<HealthResult> {
   try {
-    const client = createResourceHealthClient(subscriptionId);
+    const client = await createResourceHealthClient(subscriptionId);
     const statuses: AvailabilityStatus[] = [];
 
     const iter = resourceGroup
@@ -341,7 +349,7 @@ export async function getActivityLogs(
   maxEvents: number = 1000
 ): Promise<ActivityLogResult> {
   try {
-    const client = createMonitorClient(subscriptionId);
+    const client = await createMonitorClient(subscriptionId);
     const now = new Date();
     const start = new Date(now.getTime() - hoursBack * 60 * 60 * 1000);
 
@@ -379,7 +387,7 @@ export async function getMetrics(
   granularity: string = "PT1H"
 ): Promise<MetricsResult> {
   try {
-    const client = createMetricsQueryClient();
+    const client = await createMetricsQueryClient();
     const now = new Date();
     const start = new Date(now.getTime() - timespanHours * 60 * 60 * 1000);
     const timespan = { startTime: start, endTime: now };
@@ -410,7 +418,7 @@ export async function queryLogAnalytics(
   timespanHours: number = 24
 ): Promise<LogAnalyticsResult> {
   try {
-    const client = createLogsQueryClient();
+    const client = await createLogsQueryClient();
     const now = new Date();
     const start = new Date(now.getTime() - timespanHours * 60 * 60 * 1000);
     const timespan = { startTime: start, endTime: now };

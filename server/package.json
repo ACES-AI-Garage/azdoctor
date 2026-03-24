@@ -5,7 +5,7 @@
   "type": "module",
   "main": "build/index.js",
   "scripts": {
-    "build": "tsc && esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --outfile=build/index.js --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\"",
+    "build": "tsc && esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --outfile=build/index.js --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\" --external:@azure/*",
     "dev": "tsx src/index.ts",
     "start": "node build/index.js",
     "inspect": "npx @modelcontextprotocol/inspector node build/index.js",
