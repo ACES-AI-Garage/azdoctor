@@ -22746,9 +22746,10 @@ function registerInvestigate(server2) {
                 errors.push(result.error);
                 return null;
               }
-              const errorCount = result.tables[0]?.rows?.length ?? 0;
-              const topErrors = result.tables[0]?.rows?.map((row) => String(row[2] ?? "Unknown")).filter((v, i, arr) => arr.indexOf(v) === i).slice(0, 5) ?? [];
-              return { workspace: ws.workspaceName, errorCount, topErrors };
+              const rows = result.tables[0]?.rows ?? [];
+              const errorCount = rows.reduce((sum, row) => sum + (Number(row[2]) || 0), 0);
+              const topOperations = rows?.map((row) => `${String(row[1] ?? "Unknown")} (${row[2]} errors)`).slice(0, 5) ?? [];
+              return { workspace: ws.workspaceName, errorCount, topOperations };
             }),
             3
           );
