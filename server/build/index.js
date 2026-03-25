@@ -21258,16 +21258,6 @@ async function batchExecute(tasks, batchSize = 5) {
 }
 
 // src/tools/healthcheck.ts
-function advisorImpactToSeverity(impact) {
-  switch (impact.toLowerCase()) {
-    case "high":
-      return "critical";
-    case "medium":
-      return "warning";
-    default:
-      return "info";
-  }
-}
 function registerHealthcheck(server2) {
   server2.tool(
     "azdoctor_healthcheck",
@@ -21288,10 +21278,10 @@ function registerHealthcheck(server2) {
       const advisorQuery = resourceGroup ? [
         "advisorresources",
         "| where type == 'microsoft.advisor/recommendations'",
+        "| where properties.category =~ 'Cost'",
         `| where resourceGroup =~ '${resourceGroup}'`,
         "| project id, name, resourceGroup,",
         "    category = properties.category,",
-        "    impact = properties.impact,",
         "    problem = properties.shortDescription.problem,",
         "    solution = properties.shortDescription.solution,",
         "    affectedResource = properties.impactedValue,",
@@ -21300,9 +21290,9 @@ function registerHealthcheck(server2) {
       ].join("\n") : [
         "advisorresources",
         "| where type == 'microsoft.advisor/recommendations'",
+        "| where properties.category =~ 'Cost'",
         "| project id, name, resourceGroup,",
         "    category = properties.category,",
-        "    impact = properties.impact,",
         "    problem = properties.shortDescription.problem,",
         "    solution = properties.shortDescription.solution,",
         "    affectedResource = properties.impactedValue,",
@@ -21321,20 +21311,34 @@ function registerHealthcheck(server2) {
           const state = status.properties?.availabilityState;
           const resourceName = status.name ?? status.id ?? "unknown";
           const resourceType = status.type ?? "unknown";
+          const reasonType = status.properties?.reasonType ?? "";
+          const isUserInitiated = reasonType.toLowerCase().includes("userinit") || (status.properties?.summary ?? "").toLowerCase().includes("authorized user");
           if (state === "Unavailable") {
-            findings.push({
-              severity: "critical",
-              resource: resourceName,
-              resourceType,
-              category: "Resource Health",
-              issue: `Resource is unavailable: ${status.properties?.summary ?? "No details"}`,
-              evidence: {
-                availabilityState: state,
-                reasonType: status.properties?.reasonType,
-                detailedStatus: status.properties?.detailedStatus
-              },
-              recommendation: status.properties?.recommendedActions?.[0]?.action ?? "Check Azure Service Health for platform events, then review recent changes."
-            });
+            if (isUserInitiated) {
+              findings.push({
+                severity: "info",
+                resource: resourceName,
+                resourceType,
+                category: "Resource Health",
+                issue: `Resource stopped by authorized user`,
+                evidence: { availabilityState: state, reasonType },
+                recommendation: "No action needed if intentional."
+              });
+            } else {
+              findings.push({
+                severity: "critical",
+                resource: resourceName,
+                resourceType,
+                category: "Resource Health",
+                issue: `Resource is unavailable: ${status.properties?.summary ?? "No details"}`,
+                evidence: {
+                  availabilityState: state,
+                  reasonType,
+                  detailedStatus: status.properties?.detailedStatus
+                },
+                recommendation: status.properties?.recommendedActions?.[0]?.action ?? "Check Azure Service Health for platform events, then review recent changes."
+              });
+            }
           } else if (state === "Degraded") {
             findings.push({
               severity: "critical",
@@ -21342,10 +21346,7 @@ function registerHealthcheck(server2) {
               resourceType,
               category: "Resource Health",
               issue: `Resource is degraded: ${status.properties?.summary ?? "No details"}`,
-              evidence: {
-                availabilityState: state,
-                reasonType: status.properties?.reasonType
-              },
+              evidence: { availabilityState: state, reasonType },
               recommendation: "Investigate recent deployments or configuration changes. Check dependent resources."
             });
           }
@@ -21394,26 +21395,25 @@ function registerHealthcheck(server2) {
         errors.push(advisorResult.error);
       } else {
         for (const rec of advisorResult.resources) {
-          const impact = String(rec["impact"] ?? "Low");
           const category = String(rec["category"] ?? "Unknown");
+          if (category.toLowerCase() !== "cost") continue;
           const problem = String(rec["problem"] ?? "");
           const solution = String(rec["solution"] ?? "");
           const affectedResource = String(rec["affectedResource"] ?? "unknown");
           const affectedResourceType = String(rec["affectedResourceType"] ?? "unknown");
           const resourceGroupName = String(rec["resourceGroup"] ?? "");
           findings.push({
-            severity: advisorImpactToSeverity(impact),
+            severity: "warning",
             resource: affectedResource,
             resourceType: affectedResourceType,
-            category: `Advisor \u2014 ${category}`,
-            issue: problem || `${category} recommendation`,
+            category: "Cost",
+            issue: problem || "Cost optimization opportunity",
             evidence: {
               advisorCategory: category,
-              impact,
               resourceGroup: resourceGroupName,
               lastUpdated: rec["lastUpdated"]
             },
-            recommendation: solution || "Review this recommendation in Azure Advisor."
+            recommendation: solution || "Review this resource for potential savings."
           });
         }
       }

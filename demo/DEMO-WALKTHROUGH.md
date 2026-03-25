@@ -1,183 +1,186 @@
 # AZ Doctor Demo Walkthrough
 
-Step-by-step script for demonstrating all 18 AZ Doctor tools using the demo environment.
+> "It's Monday morning. You get a Slack message — prod is slow. Here's how you go from 'something is wrong' to 'here's the RCA and we've prevented recurrence' in under 10 minutes, without leaving your terminal."
 
-## Pre-Demo Setup
+## Before Recording
 
-### One-Time (7+ days before demo)
-
-1. Deploy the demo infrastructure:
+1. Run the load generator 30 minutes before:
    ```bash
-   cd demo/scripts
-   bash setup.sh
+   bash demo/scripts/generate-load.sh https://app-azdemo-prod-30bf1e4b.azurewebsites.net
    ```
+2. Wait 5 minutes for telemetry to land in Application Insights.
+3. Restart Copilot CLI so the MCP server connects fresh.
+4. Verify: `/mcp show azdoctor` — should show 18 tools.
 
-2. Set up baseline traffic (creates 7-day metric baseline for the `baseline` tool):
-   ```bash
-   # Add to crontab — runs every 15 minutes
-   crontab -e
-   */15 * * * * /path/to/azdoctor/demo/scripts/baseline-cron.sh https://app-azdemo-prod-XXXXXXXX.azurewebsites.net >> /tmp/azdemo-baseline.log 2>&1
-   ```
+## The Demo
 
-### Demo Day (30 minutes before)
+### Scene 1: "Something is wrong with prod" (~30s)
 
-1. Run the load generator to create a fresh incident:
-   ```bash
-   bash demo/scripts/generate-load.sh https://app-azdemo-prod-XXXXXXXX.azurewebsites.net
-   ```
+You just got paged. First thing — check the health of the production environment.
 
-2. Wait 5 minutes for telemetry to appear in Application Insights.
-
-## Demo Script
-
-### Act 1: "What's going on?" (Detection)
-
-**Tool 1 — check_permissions** (verify access)
 ```
-@azure-diagnostics Check what Azure APIs my credentials can access
+Check the health of the azdoctor-demo-prod resource group
 ```
-> Shows: which APIs are accessible, recommends RBAC roles for any gaps.
 
-**Tool 2 — sweep** (portfolio overview)
-```
-@azure-diagnostics Scan all my subscriptions for health issues
-```
-> Shows: all accessible subscriptions ranked by risk score. The BAMI subscription should show elevated risk.
+**What the audience sees:** Risk score, critical findings from Resource Health (stopped VM), Azure Advisor recommendations (missing health checks, HA gaps, cost waste), and activity log anomalies — all from one command.
 
-**Tool 3 — healthcheck** (zoom into prod)
-```
-@azure-diagnostics Check the health of the azdoctor-demo-prod resource group
-```
-> Shows: risk score, findings for unattached disk, orphaned public IP, degraded App Service, degraded SQL.
-
-**Tool 4 — cost** (waste analysis)
-```
-@azure-diagnostics Find cost waste in azdoctor-demo-prod
-```
-> Shows: unattached disk (~$1.60/mo), orphaned IP (~$3.65/mo), stopped VM (~$7/mo), empty App Service Plan (~$13/mo), potentially oversized VM.
-
-**Tool 5 — advisor** (Azure recommendations)
-```
-@azure-diagnostics Show Azure Advisor recommendations for azdoctor-demo-prod
-```
-> Shows: Advisor findings across reliability, security, performance, cost pillars.
+**Talking point:** "One command gives me Resource Health, Azure Advisor, and Activity Log findings combined — no portal clicking."
 
 ---
 
-### Act 2: "Why is it broken?" (Diagnosis)
+### Scene 2: "Why is the app broken?" (~60s)
 
-**Tool 6 — investigate** (the star of the show)
-```
-@azure-diagnostics Investigate app-azdemo-prod-XXXXXXXX in resource group azdoctor-demo-prod
-```
-> Shows: multi-signal investigation — Http5xx spike, CPU spike, "bad_deployment" diagnostic pattern, SQL dependency degraded, cascading failure detected, metric trends, recommended actions.
+Now zoom into the specific App Service that users are complaining about.
 
-**Tool 7 — baseline** (anomaly detection)
 ```
-@azure-diagnostics Is the CPU usage on app-azdemo-prod-XXXXXXXX normal right now?
+Investigate app-azdemo-prod-30bf1e4b in resource group azdoctor-demo-prod
 ```
-> Shows: current metrics vs 7-day baseline, z-scores, anomalous/elevated/normal status per metric.
 
-**Tool 8 — query** (log analytics)
-```
-@azure-diagnostics Show me failed requests for app-azdemo-prod-XXXXXXXX in the last hour
-```
-> Shows: natural language → KQL translation, auto-discovers workspace, returns failed request details.
+**What the audience sees:** Multi-signal investigation — current health status, dependency map (App Service → SQL Database), timeline of events, diagnostic pattern detection, metric trends, Log Analytics error counts, and recommended actions.
 
-**Tool 9 — compare** (prod vs preprod)
-```
-@azure-diagnostics Compare azdoctor-demo-prod vs azdoctor-demo-preprod
-```
-> Shows: resource inventory diff (prod has extra waste resources), health divergence (prod degraded, preprod healthy), change velocity difference.
+**Talking point:** "AZ Doctor correlated Resource Health, Activity Logs, Metrics, and dependent resources automatically. It found the SQL dependency, checked its health, detected the error pattern, and told me what to do — that's 5+ portal blades in one question."
 
 ---
 
-### Act 3: "What happened?" (Analysis & Reporting)
+### Scene 3: "Is this CPU spike normal?" (~30s)
 
-**Tool 10 — rca** (root cause analysis)
-```
-@azure-diagnostics Generate an RCA for app-azdemo-prod-XXXXXXXX
-```
-> Shows: structured RCA document with timeline, root cause narrative, impact assessment, remediation steps.
+The investigation showed elevated metrics. But is this actually abnormal, or does this app always run hot?
 
-**Tool 11 — playback** (timeline replay)
 ```
-@azure-diagnostics Replay the incident timeline for app-azdemo-prod-XXXXXXXX
+Is the CPU usage on app-azdemo-prod-30bf1e4b normal right now?
 ```
-> Shows: chronological walkthrough with phase markers (pre-incident, incident-start, during, resolution).
 
-**Tool 12 — diagram** (visual topology)
-```
-@azure-diagnostics Generate a dependency diagram for app-azdemo-prod-XXXXXXXX
-```
-> Shows: Mermaid diagram with App Service → SQL dependency, health status on each node.
+**What the audience sees:** Current metrics compared against the 7-day baseline using z-scores. Each metric flagged as normal, elevated, or anomalous.
+
+**Talking point:** "It compared current metrics against a 7-day rolling average. A z-score above 2 means this is statistically abnormal — not just a feeling."
 
 ---
 
-### Act 4: "Fix it and prevent recurrence" (Action)
+### Scene 4: "Show me the errors" (~30s)
 
-**Tool 13 — remediate** (safe fix)
-```
-@azure-diagnostics Restart app-azdemo-prod-XXXXXXXX to mitigate the issue
-```
-> Shows: dry-run first (risk rating, warnings, rollback hint), then execute on confirmation.
+You know something is wrong. Now look at what's actually failing.
 
-**Tool 14 — alert_rules** (prevent recurrence)
 ```
-@azure-diagnostics Generate alert rules for app-azdemo-prod-XXXXXXXX based on the investigation
+Show me failed requests for app-azdemo-prod-30bf1e4b in the last hour
 ```
-> Shows: recommended alert rules with thresholds tailored from investigation data, deployable Bicep template.
+
+**What the audience sees:** Natural language converted to KQL, workspace auto-discovered, query executed, results returned — failed requests by operation name with counts.
+
+**Talking point:** "I asked in English, it wrote the KQL, found the Log Analytics workspace, and ran the query. No need to remember KQL syntax or workspace IDs."
 
 ---
 
-### Act 5: "One command to rule them all" (Orchestration)
+### Scene 5: "Document what happened" (~30s)
 
-**Tool 15 — triage** (full pipeline)
+You've diagnosed the issue. Now generate a formal Root Cause Analysis for the incident review.
+
 ```
-@azure-diagnostics Run a full triage on app-azdemo-prod-XXXXXXXX
+Generate an RCA for app-azdemo-prod-30bf1e4b
 ```
-> Shows: permissions → investigate → baseline → alerts → journal — all in one call. ASCII topology, execution time, comprehensive report.
+
+**What the audience sees:** Structured RCA document with correlated timeline, root cause narrative, impact assessment, and remediation steps. Ready for ServiceNow or a post-incident review.
+
+**Talking point:** "This is a structured RCA document I can paste into ServiceNow or share in a post-incident review — generated in seconds, not hours."
 
 ---
 
-### Act 6: "Share and document" (Collaboration)
+### Scene 6: "Is preprod affected too?" (~30s)
 
-**Tool 16 — notify** (webhook notification)
-```
-@azure-diagnostics Send the investigation results to https://webhook.site/YOUR-UUID
-```
-> Shows: formatted message sent to webhook. Open webhook.site to show the formatted payload. Mention Teams and Slack support.
+Before you fix prod, check if preprod has the same problem — or if this is isolated.
 
-**Tool 17 — journal** (local persistence)
 ```
-@azure-diagnostics List my saved investigations
-```
-> Shows: saved journal entries from triage run. Can retrieve any past investigation.
-
-**Tool 18 — playbooks** (custom runbooks)
-```
-@azure-diagnostics Initialize sample playbooks
-```
-> Shows: creates sample diagnostic playbooks in ~/.azdoctor/playbooks/. Then:
-```
-@azure-diagnostics Match playbooks against the investigation results for app-azdemo-prod-XXXXXXXX
-```
-> Shows: matched playbooks based on resource type and investigation findings.
-
-## Talking Points
-
-- **"One question, full diagnosis"** — Instead of manually checking 5+ Azure portal blades, ask one natural language question.
-- **"Correlates signals humans miss"** — Timestamp correlation across health events, activity logs, metrics, and dependencies. Finds patterns like "deployment at 2:23 PM → errors started 2:25 PM" automatically.
-- **"Works with what you have"** — Reader RBAC role is enough. Uses your existing `az login`. No additional infrastructure or agents to deploy.
-- **"Covers 21+ resource types out of the box"** — Built-in diagnostic playbooks for App Service, SQL, VMs, AKS, Redis, Cosmos, and more.
-- **"200+ services via Microsoft Learn"** — For anything without a built-in playbook, pulls troubleshooting docs at runtime.
-- **"Safe remediation"** — Dry-run by default. Shows risk rating and rollback hints before executing.
-- **"Plugs into any MCP client"** — GitHub Copilot CLI, VS Code Copilot, Claude Desktop, Cursor, or any MCP-compatible tool.
-
-## Teardown
-
-```bash
-bash demo/scripts/teardown.sh
+Compare azdoctor-demo-prod vs azdoctor-demo-preprod
 ```
 
-Estimated cost: ~$61/month for the full demo environment. Tear down promptly after demos.
+**What the audience sees:** Resource inventory diff (prod has waste resources preprod doesn't), health divergence (prod degraded, preprod healthy), change velocity comparison.
+
+**Talking point:** "Preprod is clean — this is a prod-only issue. I can also see prod has orphaned resources that preprod doesn't, which tells me someone's been provisioning without cleaning up."
+
+---
+
+### Scene 7: "Fix it" (~30s)
+
+Time to remediate. Restart the App Service to clear the issue.
+
+```
+Restart app-azdemo-prod-30bf1e4b to mitigate the issue
+```
+
+**What the audience sees:** Dry-run by default — shows risk rating, what the action would do, rollback hints. Waits for confirmation before executing.
+
+**Talking point:** "Dry-run by default. It shows me the risk rating and what will happen before I say yes. Safe remediation, not YOLO."
+
+---
+
+### Scene 8: "Make sure this doesn't happen again" (~30s)
+
+The fire is out. Now set up monitoring so you catch it earlier next time.
+
+```
+Generate alert rules for app-azdemo-prod-30bf1e4b based on the investigation
+```
+
+**What the audience sees:** Recommended alert rules with thresholds tailored from the investigation data, plus a deployable Bicep template.
+
+**Talking point:** "It generated alert rules based on what just happened — not generic defaults. And it gave me a Bicep template I can deploy directly."
+
+---
+
+### Scene 9: "How much are we wasting?" (~30s)
+
+While you're here, check what's costing money for no reason.
+
+```
+Find cost waste in azdoctor-demo-prod
+```
+
+**What the audience sees:** Stopped VM still billing, empty App Service Plan, orphaned disk, orphaned public IP — each with estimated monthly cost and recommendation.
+
+**Talking point:** "Quick pivot — this isn't just for incidents. It found a stopped VM that's still billing, an empty App Service Plan, and orphaned resources. Easy wins."
+
+---
+
+### Closing (~30s)
+
+Voiceover or text slide:
+
+> **AZ Doctor** — 18 diagnostic tools, powered by Azure Advisor + Resource Health + Activity Logs + Metrics + Log Analytics. Zero infrastructure cost. Reader RBAC. Plugs into Copilot CLI, VS Code, Claude Desktop, Cursor, or any MCP client.
+>
+> Think of it this way: Azure SRE Agent is the full-time SRE you hire. AZ Doctor is the doctor you visit when something hurts.
+
+## Tips for Recording
+
+- **Don't wait for tool responses on camera.** Record each tool call, cut out the wait, stitch together the prompt → response. Copilot's thinking animation is not interesting to watch.
+- **Narrate over the output.** The JSON/table responses are dense — talk the audience through what matters.
+- **Keep your terminal font size large.** 16-18pt minimum so the text is readable in the video.
+- **Use a clean terminal.** Fresh Copilot CLI session, no clutter from previous commands.
+
+## Feature Coverage
+
+### Showcased in this demo (9 tools)
+
+| Tool | Scene | Role in story |
+|------|-------|---------------|
+| `healthcheck` | 1 | First response — what's wrong? |
+| `investigate` | 2 | Deep diagnosis — why is it broken? |
+| `baseline` | 3 | Is this normal? |
+| `query` | 4 | Show me the logs |
+| `rca` | 5 | Document what happened |
+| `compare` | 6 | Is preprod affected? |
+| `remediate` | 7 | Fix it |
+| `alert_rules` | 8 | Prevent recurrence |
+| `cost` | 9 | Bonus — cost waste |
+
+### Not in this demo (9 tools)
+
+| Tool | Why it's excluded | How to mention it |
+|------|-------------------|-------------------|
+| `advisor` | Advisor findings are now embedded in healthcheck | Covered implicitly in Scene 1 |
+| `triage` | Does the same as scenes 1-3 + 8 combined | "There's a one-command version that does all of this at once" |
+| `sweep` | Needs multiple subscriptions to be interesting | "It can scan all your subscriptions at once" |
+| `check_permissions` | Setup step, not part of the story | Skip |
+| `playback` | Similar to RCA timeline | "There's also a timeline replay tool for post-incident reviews" |
+| `diagram` | Mermaid output doesn't render in terminal | "Generates Mermaid diagrams for PRs and docs" |
+| `journal` | Local file save, not visually interesting | "Saves investigations locally for future reference" |
+| `notify` | Needs a webhook URL, adds complexity | "Can send results to Teams or Slack" |
+| `playbooks` | Setup/management tool, not part of incident story | "Supports custom diagnostic runbooks" |

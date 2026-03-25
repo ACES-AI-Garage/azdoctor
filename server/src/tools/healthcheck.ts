@@ -18,17 +18,6 @@ interface Finding {
   recommendation: string;
 }
 
-// Map Advisor impact to our severity levels
-function advisorImpactToSeverity(impact: string): "critical" | "warning" | "info" {
-  switch (impact.toLowerCase()) {
-    case "high":
-      return "critical";
-    case "medium":
-      return "warning";
-    default:
-      return "info";
-  }
-}
 
 export function registerHealthcheck(server: McpServer): void {
   server.tool(
@@ -61,14 +50,15 @@ export function registerHealthcheck(server: McpServer): void {
         : 0;
 
       // 2. Run Resource Health, Activity Logs, and Advisor in parallel
+      // Only fetch Cost recommendations — HA/Security/Perf/OpEx are noise in a health check.
       const advisorQuery = resourceGroup
         ? [
             "advisorresources",
             "| where type == 'microsoft.advisor/recommendations'",
+            "| where properties.category =~ 'Cost'",
             `| where resourceGroup =~ '${resourceGroup}'`,
             "| project id, name, resourceGroup,",
             "    category = properties.category,",
-            "    impact = properties.impact,",
             "    problem = properties.shortDescription.problem,",
             "    solution = properties.shortDescription.solution,",
             "    affectedResource = properties.impactedValue,",
@@ -78,9 +68,9 @@ export function registerHealthcheck(server: McpServer): void {
         : [
             "advisorresources",
             "| where type == 'microsoft.advisor/recommendations'",
+            "| where properties.category =~ 'Cost'",
             "| project id, name, resourceGroup,",
             "    category = properties.category,",
-            "    impact = properties.impact,",
             "    problem = properties.shortDescription.problem,",
             "    solution = properties.shortDescription.solution,",
             "    affectedResource = properties.impactedValue,",
@@ -102,23 +92,39 @@ export function registerHealthcheck(server: McpServer): void {
           const state = status.properties?.availabilityState;
           const resourceName = status.name ?? status.id ?? "unknown";
           const resourceType = status.type ?? "unknown";
+          const reasonType = status.properties?.reasonType ?? "";
+          const isUserInitiated = reasonType.toLowerCase().includes("userinit") ||
+            (status.properties?.summary ?? "").toLowerCase().includes("authorized user");
 
           if (state === "Unavailable") {
-            findings.push({
-              severity: "critical",
-              resource: resourceName,
-              resourceType,
-              category: "Resource Health",
-              issue: `Resource is unavailable: ${status.properties?.summary ?? "No details"}`,
-              evidence: {
-                availabilityState: state,
-                reasonType: status.properties?.reasonType,
-                detailedStatus: status.properties?.detailedStatus,
-              },
-              recommendation:
-                status.properties?.recommendedActions?.[0]?.action ??
-                "Check Azure Service Health for platform events, then review recent changes.",
-            });
+            // User-initiated stops are not incidents
+            if (isUserInitiated) {
+              findings.push({
+                severity: "info",
+                resource: resourceName,
+                resourceType,
+                category: "Resource Health",
+                issue: `Resource stopped by authorized user`,
+                evidence: { availabilityState: state, reasonType },
+                recommendation: "No action needed if intentional.",
+              });
+            } else {
+              findings.push({
+                severity: "critical",
+                resource: resourceName,
+                resourceType,
+                category: "Resource Health",
+                issue: `Resource is unavailable: ${status.properties?.summary ?? "No details"}`,
+                evidence: {
+                  availabilityState: state,
+                  reasonType,
+                  detailedStatus: status.properties?.detailedStatus,
+                },
+                recommendation:
+                  status.properties?.recommendedActions?.[0]?.action ??
+                  "Check Azure Service Health for platform events, then review recent changes.",
+              });
+            }
           } else if (state === "Degraded") {
             findings.push({
               severity: "critical",
@@ -126,10 +132,7 @@ export function registerHealthcheck(server: McpServer): void {
               resourceType,
               category: "Resource Health",
               issue: `Resource is degraded: ${status.properties?.summary ?? "No details"}`,
-              evidence: {
-                availabilityState: state,
-                reasonType: status.properties?.reasonType,
-              },
+              evidence: { availabilityState: state, reasonType },
               recommendation:
                 "Investigate recent deployments or configuration changes. Check dependent resources.",
             });
@@ -186,13 +189,16 @@ export function registerHealthcheck(server: McpServer): void {
         }
       }
 
-      // 5. Process Azure Advisor recommendations
+      // 5. Process Azure Advisor — only Cost findings (waste/savings).
+      // HA, Security, Performance, OpEx recommendations are best-practice noise
+      // in a health check context. Use the dedicated azdoctor_advisor tool for those.
       if (advisorResult.error) {
         errors.push(advisorResult.error);
       } else {
         for (const rec of advisorResult.resources) {
-          const impact = String(rec["impact"] ?? "Low");
           const category = String(rec["category"] ?? "Unknown");
+          if (category.toLowerCase() !== "cost") continue;
+
           const problem = String(rec["problem"] ?? "");
           const solution = String(rec["solution"] ?? "");
           const affectedResource = String(rec["affectedResource"] ?? "unknown");
@@ -200,18 +206,17 @@ export function registerHealthcheck(server: McpServer): void {
           const resourceGroupName = String(rec["resourceGroup"] ?? "");
 
           findings.push({
-            severity: advisorImpactToSeverity(impact),
+            severity: "warning",
             resource: affectedResource,
             resourceType: affectedResourceType,
-            category: `Advisor — ${category}`,
-            issue: problem || `${category} recommendation`,
+            category: "Cost",
+            issue: problem || "Cost optimization opportunity",
             evidence: {
               advisorCategory: category,
-              impact,
               resourceGroup: resourceGroupName,
               lastUpdated: rec["lastUpdated"],
             },
-            recommendation: solution || "Review this recommendation in Azure Advisor.",
+            recommendation: solution || "Review this resource for potential savings.",
           });
         }
       }
