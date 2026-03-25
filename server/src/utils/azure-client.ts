@@ -405,6 +405,35 @@ export async function getMetrics(
   }
 }
 
+// ─── Metric Definitions ─────────────────────────────────────────────
+
+export interface MetricDefinition {
+  name: string;
+  unit: string;
+  aggregations: string[];
+}
+
+export async function listMetricDefinitions(
+  resourceUri: string
+): Promise<{ definitions: MetricDefinition[]; error?: AzureError }> {
+  try {
+    const client = await createMetricsQueryClient();
+    const defs: MetricDefinition[] = [];
+    for await (const def of client.listMetricDefinitions(resourceUri)) {
+      if (def.name) {
+        defs.push({
+          name: def.name,
+          unit: def.unit ?? "Unspecified",
+          aggregations: def.supportedAggregationTypes ?? [],
+        });
+      }
+    }
+    return { definitions: defs };
+  } catch (err) {
+    return { definitions: [], error: classifyError(err, "metrics") };
+  }
+}
+
 // ─── Log Analytics ───────────────────────────────────────────────────
 
 export interface LogAnalyticsResult {

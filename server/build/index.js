@@ -21204,6 +21204,24 @@ async function getMetrics(resourceUri, metricNames, timespanHours = 24, granular
     return { data: null, error: classifyError(err, "metrics") };
   }
 }
+async function listMetricDefinitions(resourceUri) {
+  try {
+    const client = await createMetricsQueryClient();
+    const defs = [];
+    for await (const def of client.listMetricDefinitions(resourceUri)) {
+      if (def.name) {
+        defs.push({
+          name: def.name,
+          unit: def.unit ?? "Unspecified",
+          aggregations: def.supportedAggregationTypes ?? []
+        });
+      }
+    }
+    return { definitions: defs };
+  } catch (err) {
+    return { definitions: [], error: classifyError(err, "metrics") };
+  }
+}
 async function queryLogAnalytics(workspaceId, query, timespanHours = 24) {
   try {
     const client = await createLogsQueryClient();
@@ -21460,10 +21478,14 @@ function registerHealthcheck(server2) {
 }
 
 // src/tools/investigate.ts
+var PARENT_METRIC_RESOURCES = {
+  "microsoft.web/sites": { property: "properties.serverFarmId", label: "App Service Plan" }
+};
+var MAX_METRICS = 15;
 function registerInvestigate(server2) {
   server2.tool(
     "azdoctor_investigate",
-    "Investigate an Azure resource by gathering data from Resource Health, Activity Logs, Metrics, Log Analytics, and dependent resources. Returns comprehensive raw diagnostic data for analysis.",
+    "Investigate any Azure resource. Dynamically discovers what metrics, logs, and dependencies are available \u2014 no hardcoded resource knowledge. Returns comprehensive raw diagnostic data for AI analysis.",
     {
       resource: external_exports.string().describe("Resource name or full Azure resource ID"),
       subscription: external_exports.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
@@ -21475,68 +21497,86 @@ function registerInvestigate(server2) {
       const subscription = await resolveSubscription(subParam);
       const errors = [];
       let resourceId = resource;
-      let resourceType = "Unknown";
+      let resourceType = "unknown";
       let resourceName = resource;
-      let resolvedResourceGroup = resourceGroup;
+      let resolvedRG = resourceGroup;
+      let resourceProperties = {};
       if (!resource.startsWith("/subscriptions/")) {
-        const rgFilter = resourceGroup ? `| where resourceGroup =~ '${resourceGroup}'` : "";
-        const resolveQuery = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup, properties | take 1`;
-        const resolved = await queryResourceGraph([subscription], resolveQuery);
-        if (resolved.resources.length > 0) {
-          const r = resolved.resources[0];
-          resourceId = r.id ?? resource;
-          resourceType = r.type ?? "Unknown";
+        const rgFilter = resolvedRG ? `| where resourceGroup =~ '${resolvedRG}'` : "";
+        const q = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup, properties | take 1`;
+        const result = await queryResourceGraph([subscription], q);
+        if (result.resources.length > 0) {
+          const r = result.resources[0];
+          resourceId = r.id;
+          resourceType = r.type ?? "unknown";
           resourceName = r.name ?? resource;
-          resolvedResourceGroup = r.resourceGroup ?? resourceGroup;
-        } else if (resolved.error) {
-          errors.push(resolved.error);
+          resolvedRG = r.resourceGroup ?? resourceGroup;
+          resourceProperties = r.properties ?? {};
+        } else if (result.error) {
+          errors.push(result.error);
         }
       } else {
         const parts = resource.split("/");
         resourceName = parts[parts.length - 1] ?? resource;
-        const providerIdx = parts.indexOf("providers");
-        if (providerIdx !== -1 && parts.length > providerIdx + 2) {
-          resourceType = `${parts[providerIdx + 1]}/${parts[providerIdx + 2]}`;
-        }
-        const rgIdx = parts.indexOf("resourceGroups");
-        if (rgIdx !== -1 && parts.length > rgIdx + 1) {
-          resolvedResourceGroup = parts[rgIdx + 1];
+        const pi = parts.indexOf("providers");
+        if (pi !== -1 && parts.length > pi + 2) resourceType = `${parts[pi + 1]}/${parts[pi + 2]}`;
+        const ri = parts.indexOf("resourceGroups");
+        if (ri !== -1 && parts.length > ri + 1) resolvedRG = parts[ri + 1];
+      }
+      const metricDefs = await listMetricDefinitions(resourceId);
+      if (metricDefs.error) errors.push(metricDefs.error);
+      const priorityPatterns = [/percent/i, /cpu/i, /memory/i, /error/i, /5xx/i, /4xx/i, /fail/i, /latency/i, /response.*time/i, /request/i, /connection/i, /dtu/i, /throughput/i, /availability/i, /queue/i, /count/i];
+      const sortedDefs = [...metricDefs.definitions].sort((a, b) => {
+        const aScore = priorityPatterns.findIndex((p) => p.test(a.name));
+        const bScore = priorityPatterns.findIndex((p) => p.test(b.name));
+        const aRank = aScore === -1 ? 999 : aScore;
+        const bRank = bScore === -1 ? 999 : bScore;
+        return aRank - bRank;
+      });
+      const selectedMetrics = sortedDefs.slice(0, MAX_METRICS).map((d) => d.name);
+      const parentConfig = PARENT_METRIC_RESOURCES[resourceType.toLowerCase()];
+      let parentResourceId = null;
+      let parentLabel = null;
+      if (parentConfig) {
+        const propPath = parentConfig.property.replace("properties.", "");
+        const parentId = resourceProperties[propPath];
+        if (parentId) {
+          parentResourceId = parentId;
+          parentLabel = parentConfig.label;
+        } else {
+          const parentQuery = `Resources | where type =~ '${resourceType}' and name =~ '${resourceName}' | project parentId = ${parentConfig.property} | take 1`;
+          const parentResult = await queryResourceGraph([subscription], parentQuery);
+          if (parentResult.resources.length > 0) {
+            parentResourceId = parentResult.resources[0]["parentId"] ?? null;
+            parentLabel = parentConfig.label;
+          }
         }
       }
-      let appServicePlanId = null;
-      if (resourceType.toLowerCase() === "microsoft.web/sites") {
-        const planQuery = `Resources | where type =~ 'microsoft.web/sites' and name =~ '${resourceName}' ${resolvedResourceGroup ? `and resourceGroup =~ '${resolvedResourceGroup}'` : ""} | project serverFarmId = properties.serverFarmId | take 1`;
-        const planResult = await queryResourceGraph([subscription], planQuery);
-        if (planResult.resources.length > 0) {
-          appServicePlanId = planResult.resources[0]["serverFarmId"] ?? null;
-        }
+      let parentMetricNames = [];
+      if (parentResourceId) {
+        const parentDefs = await listMetricDefinitions(parentResourceId);
+        if (parentDefs.error) errors.push(parentDefs.error);
+        const parentSorted = [...parentDefs.definitions].sort((a, b) => {
+          const aScore = priorityPatterns.findIndex((p) => p.test(a.name));
+          const bScore = priorityPatterns.findIndex((p) => p.test(b.name));
+          return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+        });
+        parentMetricNames = parentSorted.slice(0, MAX_METRICS).map((d) => d.name);
       }
       const metricPromises = [];
-      if (resourceType.toLowerCase() === "microsoft.web/sites") {
+      if (selectedMetrics.length > 0) {
         metricPromises.push({
-          label: `${resourceName} (site)`,
-          promise: getMetrics(resourceId, ["Http5xx", "Http4xx", "Http2xx", "HttpResponseTime", "Requests", "HealthCheckStatus"], timeframeHours, "PT5M")
+          label: resourceName,
+          resourceId,
+          promise: getMetrics(resourceId, selectedMetrics, timeframeHours, "PT5M")
         });
-        if (appServicePlanId) {
-          metricPromises.push({
-            label: `${resourceName} (plan)`,
-            promise: getMetrics(appServicePlanId, ["CpuPercentage", "MemoryPercentage"], timeframeHours, "PT5M")
-          });
-        }
-      } else {
-        const RESOURCE_METRICS = {
-          "microsoft.sql/servers/databases": ["dtu_consumption_percent", "cpu_percent", "connection_failed", "deadlock", "storage_percent"],
-          "microsoft.compute/virtualmachines": ["Percentage CPU", "Available Memory Bytes", "Disk Read Bytes/sec", "Disk Write Bytes/sec", "Network In Total", "Network Out Total"],
-          "microsoft.cache/redis": ["percentProcessorTime", "usedmemorypercentage", "connectedclients", "totalcommandsprocessed", "cacheRead", "cacheWrite"],
-          "microsoft.documentdb/databaseaccounts": ["TotalRequests", "TotalRequestUnits", "ProvisionedThroughput", "ServiceAvailability"]
-        };
-        const metricNames = RESOURCE_METRICS[resourceType.toLowerCase()];
-        if (metricNames) {
-          metricPromises.push({
-            label: resourceName,
-            promise: getMetrics(resourceId, metricNames, timeframeHours, "PT5M")
-          });
-        }
+      }
+      if (parentResourceId && parentMetricNames.length > 0) {
+        metricPromises.push({
+          label: `${parentLabel ?? "parent"}`,
+          resourceId: parentResourceId,
+          promise: getMetrics(parentResourceId, parentMetricNames, timeframeHours, "PT5M")
+        });
       }
       const [healthResult, activityResult, ...metricResults] = await Promise.all([
         getResourceHealth(subscription, resourceId),
@@ -21555,21 +21595,21 @@ function registerInvestigate(server2) {
             state: currentHealth,
             summary: status.properties?.summary,
             reason: status.properties?.reasonType,
-            detailedStatus: status.properties?.detailedStatus,
             recommendedAction: status.properties?.recommendedActions?.[0]?.action
           };
         }
       }
-      const activityEvents = [];
+      const recentChanges = [];
       if (activityResult.error) {
         errors.push(activityResult.error);
       } else {
         for (const event of activityResult.events) {
           const status = event.status?.value ?? "";
-          if (status === "Failed" || event.operationName?.value?.includes("write") || event.operationName?.value?.includes("deploy") || event.operationName?.value?.includes("restart") || event.operationName?.value?.includes("delete")) {
-            activityEvents.push({
+          const op = event.operationName?.value ?? "";
+          if (status === "Failed" || op.includes("write") || op.includes("deploy") || op.includes("restart") || op.includes("delete") || op.includes("action")) {
+            recentChanges.push({
               time: event.eventTimestamp?.toISOString(),
-              operation: event.operationName?.localizedValue ?? event.operationName?.value,
+              operation: event.operationName?.localizedValue ?? op,
               status,
               caller: event.caller
             });
@@ -21579,7 +21619,7 @@ function registerInvestigate(server2) {
       const metricSummaries = [];
       for (let i = 0; i < metricResults.length; i++) {
         const result = metricResults[i];
-        const label = metricPromises[i]?.label ?? "unknown";
+        const meta = metricPromises[i];
         if (result.error) {
           errors.push(result.error);
           continue;
@@ -21588,52 +21628,53 @@ function registerInvestigate(server2) {
         for (const metric of result.data.metrics) {
           for (const ts of metric.timeseries) {
             if (!ts.data) continue;
-            const points = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0).map((dp) => ({
+            const points = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0 || dp.total !== void 0).map((dp) => ({
               time: dp.timeStamp?.toISOString() ?? "",
-              avg: dp.average ?? 0,
-              max: dp.maximum ?? 0
+              avg: dp.average ?? dp.total ?? 0,
+              max: dp.maximum ?? dp.average ?? dp.total ?? 0
             }));
             if (points.length === 0) continue;
             const avgs = points.map((p) => p.avg);
             const maxes = points.map((p) => p.max);
-            const current = avgs[avgs.length - 1];
-            const overall_avg = avgs.reduce((a, b) => a + b, 0) / avgs.length;
-            const overall_max = Math.max(...maxes);
-            const overall_min = Math.min(...avgs);
-            const recent = points.slice(-6).map((p) => ({
-              time: p.time,
-              value: Math.round(p.avg * 100) / 100
-            }));
+            const defUnit = metricDefs.definitions.find((d) => d.name === metric.name)?.unit ?? metric.unit ?? "Unspecified";
             metricSummaries.push({
               name: metric.name,
-              source: label,
-              current: Math.round(current * 100) / 100,
-              max: Math.round(overall_max * 100) / 100,
-              avg: Math.round(overall_avg * 100) / 100,
-              min: Math.round(overall_min * 100) / 100,
+              source: meta?.label ?? "unknown",
+              unit: defUnit,
+              current: Math.round(avgs[avgs.length - 1] * 100) / 100,
+              max: Math.round(Math.max(...maxes) * 100) / 100,
+              avg: Math.round(avgs.reduce((a, b) => a + b, 0) / avgs.length * 100) / 100,
+              min: Math.round(Math.min(...avgs) * 100) / 100,
               dataPoints: points.length,
-              recentValues: recent
+              recentValues: points.slice(-6).map((p) => ({ time: p.time, value: Math.round(p.avg * 100) / 100 }))
             });
           }
         }
       }
       const dependencies = [];
-      if (resolvedResourceGroup) {
-        const depQuery = `Resources | where resourceGroup =~ '${resolvedResourceGroup}' and name != '${resourceName}' and (type =~ 'Microsoft.Sql/servers/databases' or type =~ 'Microsoft.DocumentDB/databaseAccounts' or type =~ 'Microsoft.Cache/Redis' or type =~ 'Microsoft.Storage/storageAccounts' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.ServiceBus/namespaces' or type =~ 'Microsoft.EventHub/namespaces') | project id, name, type`;
+      if (resolvedRG) {
+        const depQuery = `Resources
+| where resourceGroup =~ '${resolvedRG}'
+| where name != '${resourceName}'
+| where type !in~ ('microsoft.insights/components', 'microsoft.insights/actiongroups', 'microsoft.insights/smartdetectoralertrules', 'microsoft.operationalinsights/workspaces', 'microsoft.alertsmanagement/smartdetectoralertrules', 'microsoft.network/virtualnetworks', 'microsoft.network/networkinterfaces', 'microsoft.compute/disks', 'microsoft.network/publicipaddresses', 'microsoft.network/networksecuritygroups')
+| project id, name, type
+| take 20`;
         const depResult = await queryResourceGraph([subscription], depQuery);
         if (depResult.error) errors.push(depResult.error);
-        const uniqueDeps = /* @__PURE__ */ new Map();
-        for (const dep of depResult.resources) {
-          const id = dep.id;
-          if (!uniqueDeps.has(id)) {
-            uniqueDeps.set(id, { id, name: dep.name, type: dep.type });
-          }
-        }
-        if (uniqueDeps.size > 0) {
+        const deps = depResult.resources.map((d) => ({
+          id: d.id,
+          name: d.name,
+          type: d.type
+        }));
+        if (deps.length > 0) {
           const healthChecks = await batchExecute(
-            Array.from(uniqueDeps.values()).map((dep) => async () => {
+            deps.map((dep) => async () => {
               const h = await getResourceHealth(subscription, dep.id);
-              return { name: dep.name, type: dep.type, health: h.statuses[0]?.properties?.availabilityState ?? "Unknown" };
+              return {
+                name: dep.name,
+                type: dep.type,
+                health: h.statuses[0]?.properties?.availabilityState ?? "Unknown"
+              };
             }),
             5
           );
@@ -21641,25 +21682,22 @@ function registerInvestigate(server2) {
         }
       }
       let logData = null;
-      if (resolvedResourceGroup) {
-        const wsResult = await discoverWorkspaces(subscription, resolvedResourceGroup);
+      if (resolvedRG) {
+        const wsResult = await discoverWorkspaces(subscription, resolvedRG);
         if (wsResult.workspaces.length > 0) {
           const ws = wsResult.workspaces[0];
-          const [reqResult, excResult, depResult] = await Promise.all([
-            // Failed requests with status codes and duration
+          const [reqResult, excResult, depFail] = await Promise.all([
             queryLogAnalytics(ws.workspaceId, `AppRequests
 | where TimeGenerated > ago(${timeframeHours}h)
 | where Success == false
 | summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by OperationName, ResultCode
 | order by Count desc
 | take 10`, timeframeHours),
-            // Exception details
             queryLogAnalytics(ws.workspaceId, `AppExceptions
 | where TimeGenerated > ago(${timeframeHours}h)
 | summarize Count = count() by ExceptionType, OuterMessage
 | order by Count desc
 | take 10`, timeframeHours),
-            // Dependency failures (SQL calls, HTTP calls, etc.)
             queryLogAnalytics(ws.workspaceId, `AppDependencies
 | where TimeGenerated > ago(${timeframeHours}h)
 | where Success == false
@@ -21669,53 +21707,59 @@ function registerInvestigate(server2) {
           ]);
           if (reqResult.error) errors.push(reqResult.error);
           if (excResult.error) errors.push(excResult.error);
-          if (depResult.error) errors.push(depResult.error);
-          const failedRequests = (reqResult.tables?.[0]?.rows ?? []).map((r) => ({
-            operation: String(r[0] ?? ""),
-            statusCode: String(r[1] ?? ""),
-            count: Number(r[2]) || 0,
-            avgDurationMs: Number(r[3]) || 0
-          }));
-          const exceptions = (excResult.tables?.[0]?.rows ?? []).map((r) => ({
-            type: String(r[0] ?? ""),
-            message: String(r[1] ?? ""),
-            count: Number(r[2]) || 0
-          }));
-          const dependencyFailures = (depResult.tables?.[0]?.rows ?? []).map((r) => ({
-            target: String(r[0] ?? ""),
-            type: String(r[1] ?? ""),
-            resultCode: String(r[2] ?? ""),
-            count: Number(r[3]) || 0,
-            avgDurationMs: Number(r[4]) || 0
-          }));
+          if (depFail.error) errors.push(depFail.error);
           logData = {
             workspace: ws.workspaceName,
-            failedRequests,
-            exceptions,
-            dependencyFailures
+            failedRequests: (reqResult.tables?.[0]?.rows ?? []).map((r) => ({
+              operation: String(r[0] ?? ""),
+              statusCode: String(r[1] ?? ""),
+              count: Number(r[2]) || 0,
+              avgDurationMs: Number(r[3]) || 0
+            })),
+            exceptions: (excResult.tables?.[0]?.rows ?? []).map((r) => ({
+              type: String(r[0] ?? ""),
+              message: String(r[1] ?? ""),
+              count: Number(r[2]) || 0
+            })),
+            dependencyFailures: (depFail.tables?.[0]?.rows ?? []).map((r) => ({
+              target: String(r[0] ?? ""),
+              type: String(r[1] ?? ""),
+              resultCode: String(r[2] ?? ""),
+              count: Number(r[3]) || 0,
+              avgDurationMs: Number(r[4]) || 0
+            }))
           };
         }
       }
       const response = {
         resource: resourceName,
         resourceType,
-        resourceGroup: resolvedResourceGroup,
+        resourceGroup: resolvedRG,
         currentHealth
       };
       if (healthDetails) response.healthDetails = healthDetails;
       if (symptom) response.reportedSymptom = symptom;
       if (metricSummaries.length > 0) {
         response.metrics = metricSummaries;
+      } else if (selectedMetrics.length === 0 && metricDefs.definitions.length === 0) {
+        response.metrics = "This resource type does not emit Azure Monitor metrics.";
       } else {
-        response.metrics = "No metric data available \u2014 check if the resource emits metrics or if the timeframe is too narrow.";
+        response.metrics = `Metrics requested (${selectedMetrics.join(", ")}) but no data returned for the ${timeframeHours}h window.`;
       }
-      if (activityEvents.length > 0) {
-        response.recentChanges = activityEvents;
+      if (metricDefs.definitions.length > MAX_METRICS) {
+        response.additionalMetricsAvailable = metricDefs.definitions.slice(MAX_METRICS).map((d) => d.name);
+      }
+      if (recentChanges.length > 0) {
+        response.recentChanges = recentChanges;
       } else {
-        response.recentChanges = "No write operations or failures in the activity log for the investigation window.";
+        response.recentChanges = "No write operations or failures in the activity log.";
       }
       if (logData) {
-        response.logAnalytics = logData;
+        if (logData.failedRequests.length > 0 || logData.exceptions.length > 0 || logData.dependencyFailures.length > 0) {
+          response.logAnalytics = logData;
+        } else {
+          response.logAnalytics = { workspace: logData.workspace, summary: "No failed requests, exceptions, or dependency failures found." };
+        }
       }
       if (dependencies.length > 0) {
         response.dependencies = dependencies;
@@ -21724,9 +21768,7 @@ function registerInvestigate(server2) {
         response.apiErrors = errors.map((e) => `${e.code}: ${e.message}`);
       }
       return {
-        content: [
-          { type: "text", text: JSON.stringify(response, null, 2) }
-        ]
+        content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
       };
     }
   );
