@@ -226,10 +226,6 @@ export const DEPENDENCY_MAP: Record<string, DependencyQuery[]> = {
       description: "Service Bus / Event Hub",
       query: "Resources | where resourceGroup =~ '{rg}' and (type =~ 'Microsoft.ServiceBus/namespaces' or type =~ 'Microsoft.EventHub/namespaces') | project id, name, type",
     },
-    {
-      description: "App Service Plan (hosting plan)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/serverfarms' | project id, name, type",
-    },
   ],
   "microsoft.compute/virtualmachines": [
     {
