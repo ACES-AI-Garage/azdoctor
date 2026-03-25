@@ -21459,6 +21459,279 @@ function registerHealthcheck(server2) {
   );
 }
 
+// src/tools/investigate.ts
+function registerInvestigate(server2) {
+  server2.tool(
+    "azdoctor_investigate",
+    "Investigate an Azure resource by gathering data from Resource Health, Activity Logs, Metrics, Log Analytics, and dependent resources. Returns comprehensive raw diagnostic data for analysis.",
+    {
+      resource: external_exports.string().describe("Resource name or full Azure resource ID"),
+      subscription: external_exports.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
+      resourceGroup: external_exports.string().optional().describe("Resource group name (helps resolve resource ID faster)"),
+      timeframeHours: external_exports.number().default(24).describe("How many hours back to investigate"),
+      symptom: external_exports.string().optional().describe('User-described symptom (e.g., "slow", "500 errors", "unreachable")')
+    },
+    async ({ resource, subscription: subParam, resourceGroup, timeframeHours, symptom }) => {
+      const subscription = await resolveSubscription(subParam);
+      const errors = [];
+      let resourceId = resource;
+      let resourceType = "Unknown";
+      let resourceName = resource;
+      let resolvedResourceGroup = resourceGroup;
+      if (!resource.startsWith("/subscriptions/")) {
+        const rgFilter = resourceGroup ? `| where resourceGroup =~ '${resourceGroup}'` : "";
+        const resolveQuery = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup, properties | take 1`;
+        const resolved = await queryResourceGraph([subscription], resolveQuery);
+        if (resolved.resources.length > 0) {
+          const r = resolved.resources[0];
+          resourceId = r.id ?? resource;
+          resourceType = r.type ?? "Unknown";
+          resourceName = r.name ?? resource;
+          resolvedResourceGroup = r.resourceGroup ?? resourceGroup;
+        } else if (resolved.error) {
+          errors.push(resolved.error);
+        }
+      } else {
+        const parts = resource.split("/");
+        resourceName = parts[parts.length - 1] ?? resource;
+        const providerIdx = parts.indexOf("providers");
+        if (providerIdx !== -1 && parts.length > providerIdx + 2) {
+          resourceType = `${parts[providerIdx + 1]}/${parts[providerIdx + 2]}`;
+        }
+        const rgIdx = parts.indexOf("resourceGroups");
+        if (rgIdx !== -1 && parts.length > rgIdx + 1) {
+          resolvedResourceGroup = parts[rgIdx + 1];
+        }
+      }
+      let appServicePlanId = null;
+      if (resourceType.toLowerCase() === "microsoft.web/sites") {
+        const planQuery = `Resources | where type =~ 'microsoft.web/sites' and name =~ '${resourceName}' ${resolvedResourceGroup ? `and resourceGroup =~ '${resolvedResourceGroup}'` : ""} | project serverFarmId = properties.serverFarmId | take 1`;
+        const planResult = await queryResourceGraph([subscription], planQuery);
+        if (planResult.resources.length > 0) {
+          appServicePlanId = planResult.resources[0]["serverFarmId"] ?? null;
+        }
+      }
+      const metricPromises = [];
+      if (resourceType.toLowerCase() === "microsoft.web/sites") {
+        metricPromises.push({
+          label: `${resourceName} (site)`,
+          promise: getMetrics(resourceId, ["Http5xx", "Http4xx", "Http2xx", "HttpResponseTime", "Requests", "HealthCheckStatus"], timeframeHours, "PT5M")
+        });
+        if (appServicePlanId) {
+          metricPromises.push({
+            label: `${resourceName} (plan)`,
+            promise: getMetrics(appServicePlanId, ["CpuPercentage", "MemoryPercentage"], timeframeHours, "PT5M")
+          });
+        }
+      } else {
+        const RESOURCE_METRICS = {
+          "microsoft.sql/servers/databases": ["dtu_consumption_percent", "cpu_percent", "connection_failed", "deadlock", "storage_percent"],
+          "microsoft.compute/virtualmachines": ["Percentage CPU", "Available Memory Bytes", "Disk Read Bytes/sec", "Disk Write Bytes/sec", "Network In Total", "Network Out Total"],
+          "microsoft.cache/redis": ["percentProcessorTime", "usedmemorypercentage", "connectedclients", "totalcommandsprocessed", "cacheRead", "cacheWrite"],
+          "microsoft.documentdb/databaseaccounts": ["TotalRequests", "TotalRequestUnits", "ProvisionedThroughput", "ServiceAvailability"]
+        };
+        const metricNames = RESOURCE_METRICS[resourceType.toLowerCase()];
+        if (metricNames) {
+          metricPromises.push({
+            label: resourceName,
+            promise: getMetrics(resourceId, metricNames, timeframeHours, "PT5M")
+          });
+        }
+      }
+      const [healthResult, activityResult, ...metricResults] = await Promise.all([
+        getResourceHealth(subscription, resourceId),
+        getActivityLogs(subscription, timeframeHours, resourceId),
+        ...metricPromises.map((m) => m.promise)
+      ]);
+      let currentHealth = "Unknown";
+      let healthDetails;
+      if (healthResult.error) {
+        errors.push(healthResult.error);
+      } else if (healthResult.statuses.length > 0) {
+        const status = healthResult.statuses[0];
+        currentHealth = status.properties?.availabilityState ?? "Unknown";
+        if (currentHealth !== "Available") {
+          healthDetails = {
+            state: currentHealth,
+            summary: status.properties?.summary,
+            reason: status.properties?.reasonType,
+            detailedStatus: status.properties?.detailedStatus,
+            recommendedAction: status.properties?.recommendedActions?.[0]?.action
+          };
+        }
+      }
+      const activityEvents = [];
+      if (activityResult.error) {
+        errors.push(activityResult.error);
+      } else {
+        for (const event of activityResult.events) {
+          const status = event.status?.value ?? "";
+          if (status === "Failed" || event.operationName?.value?.includes("write") || event.operationName?.value?.includes("deploy") || event.operationName?.value?.includes("restart") || event.operationName?.value?.includes("delete")) {
+            activityEvents.push({
+              time: event.eventTimestamp?.toISOString(),
+              operation: event.operationName?.localizedValue ?? event.operationName?.value,
+              status,
+              caller: event.caller
+            });
+          }
+        }
+      }
+      const metricSummaries = [];
+      for (let i = 0; i < metricResults.length; i++) {
+        const result = metricResults[i];
+        const label = metricPromises[i]?.label ?? "unknown";
+        if (result.error) {
+          errors.push(result.error);
+          continue;
+        }
+        if (!result.data) continue;
+        for (const metric of result.data.metrics) {
+          for (const ts of metric.timeseries) {
+            if (!ts.data) continue;
+            const points = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0).map((dp) => ({
+              time: dp.timeStamp?.toISOString() ?? "",
+              avg: dp.average ?? 0,
+              max: dp.maximum ?? 0
+            }));
+            if (points.length === 0) continue;
+            const avgs = points.map((p) => p.avg);
+            const maxes = points.map((p) => p.max);
+            const current = avgs[avgs.length - 1];
+            const overall_avg = avgs.reduce((a, b) => a + b, 0) / avgs.length;
+            const overall_max = Math.max(...maxes);
+            const overall_min = Math.min(...avgs);
+            const recent = points.slice(-6).map((p) => ({
+              time: p.time,
+              value: Math.round(p.avg * 100) / 100
+            }));
+            metricSummaries.push({
+              name: metric.name,
+              source: label,
+              current: Math.round(current * 100) / 100,
+              max: Math.round(overall_max * 100) / 100,
+              avg: Math.round(overall_avg * 100) / 100,
+              min: Math.round(overall_min * 100) / 100,
+              dataPoints: points.length,
+              recentValues: recent
+            });
+          }
+        }
+      }
+      const dependencies = [];
+      if (resolvedResourceGroup) {
+        const depQuery = `Resources | where resourceGroup =~ '${resolvedResourceGroup}' and name != '${resourceName}' and (type =~ 'Microsoft.Sql/servers/databases' or type =~ 'Microsoft.DocumentDB/databaseAccounts' or type =~ 'Microsoft.Cache/Redis' or type =~ 'Microsoft.Storage/storageAccounts' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.ServiceBus/namespaces' or type =~ 'Microsoft.EventHub/namespaces') | project id, name, type`;
+        const depResult = await queryResourceGraph([subscription], depQuery);
+        if (depResult.error) errors.push(depResult.error);
+        const uniqueDeps = /* @__PURE__ */ new Map();
+        for (const dep of depResult.resources) {
+          const id = dep.id;
+          if (!uniqueDeps.has(id)) {
+            uniqueDeps.set(id, { id, name: dep.name, type: dep.type });
+          }
+        }
+        if (uniqueDeps.size > 0) {
+          const healthChecks = await batchExecute(
+            Array.from(uniqueDeps.values()).map((dep) => async () => {
+              const h = await getResourceHealth(subscription, dep.id);
+              return { name: dep.name, type: dep.type, health: h.statuses[0]?.properties?.availabilityState ?? "Unknown" };
+            }),
+            5
+          );
+          dependencies.push(...healthChecks);
+        }
+      }
+      let logData = null;
+      if (resolvedResourceGroup) {
+        const wsResult = await discoverWorkspaces(subscription, resolvedResourceGroup);
+        if (wsResult.workspaces.length > 0) {
+          const ws = wsResult.workspaces[0];
+          const [reqResult, excResult, depResult] = await Promise.all([
+            // Failed requests with status codes and duration
+            queryLogAnalytics(ws.workspaceId, `AppRequests
+| where TimeGenerated > ago(${timeframeHours}h)
+| where Success == false
+| summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by OperationName, ResultCode
+| order by Count desc
+| take 10`, timeframeHours),
+            // Exception details
+            queryLogAnalytics(ws.workspaceId, `AppExceptions
+| where TimeGenerated > ago(${timeframeHours}h)
+| summarize Count = count() by ExceptionType, OuterMessage
+| order by Count desc
+| take 10`, timeframeHours),
+            // Dependency failures (SQL calls, HTTP calls, etc.)
+            queryLogAnalytics(ws.workspaceId, `AppDependencies
+| where TimeGenerated > ago(${timeframeHours}h)
+| where Success == false
+| summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by Target, DependencyType = Type, ResultCode
+| order by Count desc
+| take 10`, timeframeHours)
+          ]);
+          if (reqResult.error) errors.push(reqResult.error);
+          if (excResult.error) errors.push(excResult.error);
+          if (depResult.error) errors.push(depResult.error);
+          const failedRequests = (reqResult.tables?.[0]?.rows ?? []).map((r) => ({
+            operation: String(r[0] ?? ""),
+            statusCode: String(r[1] ?? ""),
+            count: Number(r[2]) || 0,
+            avgDurationMs: Number(r[3]) || 0
+          }));
+          const exceptions = (excResult.tables?.[0]?.rows ?? []).map((r) => ({
+            type: String(r[0] ?? ""),
+            message: String(r[1] ?? ""),
+            count: Number(r[2]) || 0
+          }));
+          const dependencyFailures = (depResult.tables?.[0]?.rows ?? []).map((r) => ({
+            target: String(r[0] ?? ""),
+            type: String(r[1] ?? ""),
+            resultCode: String(r[2] ?? ""),
+            count: Number(r[3]) || 0,
+            avgDurationMs: Number(r[4]) || 0
+          }));
+          logData = {
+            workspace: ws.workspaceName,
+            failedRequests,
+            exceptions,
+            dependencyFailures
+          };
+        }
+      }
+      const response = {
+        resource: resourceName,
+        resourceType,
+        resourceGroup: resolvedResourceGroup,
+        currentHealth
+      };
+      if (healthDetails) response.healthDetails = healthDetails;
+      if (symptom) response.reportedSymptom = symptom;
+      if (metricSummaries.length > 0) {
+        response.metrics = metricSummaries;
+      } else {
+        response.metrics = "No metric data available \u2014 check if the resource emits metrics or if the timeframe is too narrow.";
+      }
+      if (activityEvents.length > 0) {
+        response.recentChanges = activityEvents;
+      } else {
+        response.recentChanges = "No write operations or failures in the activity log for the investigation window.";
+      }
+      if (logData) {
+        response.logAnalytics = logData;
+      }
+      if (dependencies.length > 0) {
+        response.dependencies = dependencies;
+      }
+      if (errors.length > 0) {
+        response.apiErrors = errors.map((e) => `${e.code}: ${e.message}`);
+      }
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(response, null, 2) }
+        ]
+      };
+    }
+  );
+}
+
 // src/utils/correlator.ts
 var ANOMALY_SOURCES = /* @__PURE__ */ new Set(["ResourceHealth", "Metrics", "ServiceHealth"]);
 var CHANGE_SOURCES = /* @__PURE__ */ new Set(["ActivityLog"]);
@@ -21958,300 +22231,6 @@ function detectTrends(dataPoints, metricName) {
   };
 }
 
-// src/utils/metric-config.ts
-var TYPE_SHORTCUTS = {
-  VM: "microsoft.compute/virtualmachines",
-  SQL: "microsoft.sql/servers/databases",
-  APPSERVICE: "microsoft.web/sites",
-  APPPLAN: "microsoft.web/serverfarms",
-  REDIS: "microsoft.cache/redis",
-  COSMOS: "microsoft.documentdb/databaseaccounts",
-  AKS: "microsoft.containerservice/managedclusters",
-  STORAGE: "microsoft.storage/storageaccounts",
-  KEYVAULT: "microsoft.keyvault/vaults",
-  APIM: "microsoft.apimanagement/service",
-  SERVICEBUS: "microsoft.servicebus/namespaces",
-  EVENTHUB: "microsoft.eventhub/namespaces",
-  POSTGRES: "microsoft.dbforpostgresql/flexibleservers",
-  MYSQL: "microsoft.dbformysql/flexibleservers",
-  APPGW: "microsoft.network/applicationgateways",
-  LB: "microsoft.network/loadbalancers",
-  FIREWALL: "microsoft.network/azurefirewalls",
-  CDN: "microsoft.cdn/profiles",
-  COGNITIVE: "microsoft.cognitiveservices/accounts",
-  SIGNALR: "microsoft.signalrservice/signalr"
-};
-function loadThresholdOverrides() {
-  const overrides = { perType: {} };
-  const globalWarn = process.env.AZDOCTOR_THRESHOLD_WARNING;
-  if (globalWarn) overrides.globalWarning = parseInt(globalWarn, 10);
-  const globalCrit = process.env.AZDOCTOR_THRESHOLD_CRITICAL;
-  if (globalCrit) overrides.globalCritical = parseInt(globalCrit, 10);
-  for (const [shortcut, fullType] of Object.entries(TYPE_SHORTCUTS)) {
-    const warn = process.env[`AZDOCTOR_THRESHOLD_${shortcut}_WARNING`];
-    const crit = process.env[`AZDOCTOR_THRESHOLD_${shortcut}_CRITICAL`];
-    if (warn || crit) {
-      overrides.perType[fullType] = {
-        warning: warn ? parseInt(warn, 10) : void 0,
-        critical: crit ? parseInt(crit, 10) : void 0
-      };
-    }
-  }
-  return overrides;
-}
-var thresholdOverrides = loadThresholdOverrides();
-var METRIC_MAP = {
-  // Compute
-  "microsoft.web/sites": {
-    names: ["Http5xx", "Http4xx", "HttpResponseTime", "CpuPercentage", "MemoryPercentage", "HealthCheckStatus"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.web/serverfarms": {
-    names: ["CpuPercentage", "MemoryPercentage", "DiskQueueLength", "HttpQueueLength"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.compute/virtualmachines": {
-    names: ["Percentage CPU", "Available Memory Bytes", "OS Disk Queue Depth", "Network In Total", "Network Out Total"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.containerservice/managedclusters": {
-    names: ["node_cpu_usage_percentage", "node_memory_rss_percentage", "kube_pod_status_ready"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Databases
-  "microsoft.sql/servers/databases": {
-    names: ["dtu_consumption_percent", "connection_failed", "deadlock", "storage_percent", "workers_percent"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.documentdb/databaseaccounts": {
-    names: ["TotalRequestUnits", "NormalizedRUConsumption", "TotalRequests", "Http429"],
-    warningPct: 80,
-    criticalPct: 95
-  },
-  "microsoft.dbformysql/flexibleservers": {
-    names: ["cpu_percent", "memory_percent", "io_consumption_percent", "active_connections", "storage_percent"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.dbforpostgresql/flexibleservers": {
-    names: ["cpu_percent", "memory_percent", "storage_percent", "active_connections"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Caching
-  "microsoft.cache/redis": {
-    names: ["percentProcessorTime", "usedmemorypercentage", "serverLoad", "cacheRead", "cacheWrite", "connectedclients"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Storage
-  "microsoft.storage/storageaccounts": {
-    names: ["Availability", "SuccessE2ELatency", "SuccessServerLatency", "Transactions"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Networking
-  "microsoft.network/applicationgateways": {
-    names: ["TotalRequests", "FailedRequests", "ResponseStatus", "HealthyHostCount", "UnhealthyHostCount", "BackendResponseStatus"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.network/loadbalancers": {
-    names: ["SnatConnectionCount", "AllocatedSnatPorts", "UsedSnatPorts", "DipAvailability", "VipAvailability"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.network/azurefirewalls": {
-    names: ["Throughput", "ApplicationRuleHit", "NetworkRuleHit", "FirewallHealth"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.cdn/profiles": {
-    names: ["RequestCount", "ByteHitRatio", "OriginHealthPercentage", "TotalLatency"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Messaging
-  "microsoft.servicebus/namespaces": {
-    names: ["IncomingRequests", "ServerErrors", "ThrottledRequests", "ActiveMessages", "DeadletteredMessages"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.eventhub/namespaces": {
-    names: ["IncomingRequests", "ServerErrors", "ThrottledRequests", "OutgoingMessages", "IncomingBytes"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // AI & API
-  "microsoft.cognitiveservices/accounts": {
-    names: ["TotalCalls", "TotalErrors", "Latency", "SuccessRate"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.apimanagement/service": {
-    names: ["TotalRequests", "FailedRequests", "UnauthorizedRequests", "BackendDuration", "Capacity"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Security
-  "microsoft.keyvault/vaults": {
-    names: ["ServiceApiHit", "ServiceApiLatency", "Availability", "SaturationShoebox"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // SignalR
-  "microsoft.signalrservice/signalr": {
-    names: ["ConnectionCount", "MessageCount", "ServerLoad", "ConnectionCloseCount"],
-    warningPct: 80,
-    criticalPct: 90
-  }
-};
-var DEPENDENCY_MAP = {
-  "microsoft.web/sites": [
-    {
-      description: "Databases (SQL, MySQL, PostgreSQL, Cosmos DB)",
-      query: "Resources | where resourceGroup =~ '{rg}' and (type =~ 'Microsoft.Sql/servers/databases' or type =~ 'Microsoft.DocumentDB/databaseAccounts' or type =~ 'Microsoft.DBforMySQL/flexibleServers' or type =~ 'Microsoft.DBforPostgreSQL/flexibleServers') | project id, name, type"
-    },
-    {
-      description: "Caches (Redis)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Cache/Redis' | project id, name, type"
-    },
-    {
-      description: "Storage accounts",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Storage/storageAccounts' | project id, name, type"
-    },
-    {
-      description: "Key Vaults",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.KeyVault/vaults' | project id, name, type"
-    },
-    {
-      description: "Service Bus / Event Hub",
-      query: "Resources | where resourceGroup =~ '{rg}' and (type =~ 'Microsoft.ServiceBus/namespaces' or type =~ 'Microsoft.EventHub/namespaces') | project id, name, type"
-    }
-  ],
-  "microsoft.compute/virtualmachines": [
-    {
-      description: "Disks",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/disks' | project id, name, type"
-    },
-    {
-      description: "Network interfaces",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Network/networkInterfaces' | project id, name, type"
-    },
-    {
-      description: "Network security groups",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Network/networkSecurityGroups' | project id, name, type"
-    }
-  ],
-  "microsoft.containerservice/managedclusters": [
-    {
-      description: "Container registries",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.ContainerRegistry/registries' | project id, name, type"
-    },
-    {
-      description: "Key Vaults",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.KeyVault/vaults' | project id, name, type"
-    },
-    {
-      description: "Storage accounts",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Storage/storageAccounts' | project id, name, type"
-    }
-  ],
-  "microsoft.network/applicationgateways": [
-    {
-      description: "Backend App Services",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    },
-    {
-      description: "Backend VMs",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/virtualMachines' | project id, name, type"
-    }
-  ],
-  "microsoft.apimanagement/service": [
-    {
-      description: "Backend App Services",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    },
-    {
-      description: "Backend Functions",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' and kind contains 'functionapp' | project id, name, type"
-    }
-  ],
-  "microsoft.sql/servers/databases": [
-    {
-      description: "Dependent App Services",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    }
-  ],
-  "microsoft.web/serverfarms": [
-    {
-      description: "App Services on this plan",
-      query: "Resources | where type =~ 'Microsoft.Web/sites' and resourceGroup =~ '{rg}' | project id, name, type"
-    }
-  ],
-  "microsoft.cache/redis": [
-    {
-      description: "App Services (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    }
-  ],
-  "microsoft.keyvault/vaults": [
-    {
-      description: "App Services (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    },
-    {
-      description: "VMs (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/virtualMachines' | project id, name, type"
-    }
-  ],
-  "microsoft.network/loadbalancers": [
-    {
-      description: "Backend VMs",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/virtualMachines' | project id, name, type"
-    }
-  ],
-  "microsoft.servicebus/namespaces": [
-    {
-      description: "App Services (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    },
-    {
-      description: "Functions (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' and kind contains 'functionapp' | project id, name, type"
-    }
-  ],
-  "microsoft.eventhub/namespaces": [
-    {
-      description: "App Services (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    }
-  ]
-};
-function getMetricConfig(resourceType) {
-  const base = METRIC_MAP[resourceType.toLowerCase()];
-  if (!base) return void 0;
-  const typeOverride = thresholdOverrides.perType[resourceType.toLowerCase()];
-  return {
-    names: base.names,
-    warningPct: typeOverride?.warning ?? thresholdOverrides.globalWarning ?? base.warningPct,
-    criticalPct: typeOverride?.critical ?? thresholdOverrides.globalCritical ?? base.criticalPct
-  };
-}
-function getDependencyQueries(resourceType, resourceGroup) {
-  const queries = DEPENDENCY_MAP[resourceType.toLowerCase()];
-  if (!queries) return [];
-  return queries.map((q) => ({
-    ...q,
-    query: q.query.replace(/\{rg\}/g, resourceGroup)
-  }));
-}
-
 // src/utils/formatters.ts
 function formatRCA(input) {
   const timelineRows = input.timeline.length > 0 ? input.timeline.map(
@@ -22546,381 +22525,298 @@ timeline
   return lines.join("\n");
 }
 
-// src/tools/investigate.ts
-function registerInvestigate(server2) {
-  server2.tool(
-    "azdoctor_investigate",
-    "Investigate a specific Azure resource or incident. Performs multi-signal correlation across Resource Health, Activity Logs, Metrics, and dependent resources to identify root cause.",
+// src/utils/metric-config.ts
+var TYPE_SHORTCUTS = {
+  VM: "microsoft.compute/virtualmachines",
+  SQL: "microsoft.sql/servers/databases",
+  APPSERVICE: "microsoft.web/sites",
+  APPPLAN: "microsoft.web/serverfarms",
+  REDIS: "microsoft.cache/redis",
+  COSMOS: "microsoft.documentdb/databaseaccounts",
+  AKS: "microsoft.containerservice/managedclusters",
+  STORAGE: "microsoft.storage/storageaccounts",
+  KEYVAULT: "microsoft.keyvault/vaults",
+  APIM: "microsoft.apimanagement/service",
+  SERVICEBUS: "microsoft.servicebus/namespaces",
+  EVENTHUB: "microsoft.eventhub/namespaces",
+  POSTGRES: "microsoft.dbforpostgresql/flexibleservers",
+  MYSQL: "microsoft.dbformysql/flexibleservers",
+  APPGW: "microsoft.network/applicationgateways",
+  LB: "microsoft.network/loadbalancers",
+  FIREWALL: "microsoft.network/azurefirewalls",
+  CDN: "microsoft.cdn/profiles",
+  COGNITIVE: "microsoft.cognitiveservices/accounts",
+  SIGNALR: "microsoft.signalrservice/signalr"
+};
+function loadThresholdOverrides() {
+  const overrides = { perType: {} };
+  const globalWarn = process.env.AZDOCTOR_THRESHOLD_WARNING;
+  if (globalWarn) overrides.globalWarning = parseInt(globalWarn, 10);
+  const globalCrit = process.env.AZDOCTOR_THRESHOLD_CRITICAL;
+  if (globalCrit) overrides.globalCritical = parseInt(globalCrit, 10);
+  for (const [shortcut, fullType] of Object.entries(TYPE_SHORTCUTS)) {
+    const warn = process.env[`AZDOCTOR_THRESHOLD_${shortcut}_WARNING`];
+    const crit = process.env[`AZDOCTOR_THRESHOLD_${shortcut}_CRITICAL`];
+    if (warn || crit) {
+      overrides.perType[fullType] = {
+        warning: warn ? parseInt(warn, 10) : void 0,
+        critical: crit ? parseInt(crit, 10) : void 0
+      };
+    }
+  }
+  return overrides;
+}
+var thresholdOverrides = loadThresholdOverrides();
+var METRIC_MAP = {
+  // Compute
+  "microsoft.web/sites": {
+    names: ["Http5xx", "Http4xx", "HttpResponseTime", "CpuPercentage", "MemoryPercentage", "HealthCheckStatus"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  "microsoft.web/serverfarms": {
+    names: ["CpuPercentage", "MemoryPercentage", "DiskQueueLength", "HttpQueueLength"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  "microsoft.compute/virtualmachines": {
+    names: ["Percentage CPU", "Available Memory Bytes", "OS Disk Queue Depth", "Network In Total", "Network Out Total"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  "microsoft.containerservice/managedclusters": {
+    names: ["node_cpu_usage_percentage", "node_memory_rss_percentage", "kube_pod_status_ready"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  // Databases
+  "microsoft.sql/servers/databases": {
+    names: ["dtu_consumption_percent", "connection_failed", "deadlock", "storage_percent", "workers_percent"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  "microsoft.documentdb/databaseaccounts": {
+    names: ["TotalRequestUnits", "NormalizedRUConsumption", "TotalRequests", "Http429"],
+    warningPct: 80,
+    criticalPct: 95
+  },
+  "microsoft.dbformysql/flexibleservers": {
+    names: ["cpu_percent", "memory_percent", "io_consumption_percent", "active_connections", "storage_percent"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  "microsoft.dbforpostgresql/flexibleservers": {
+    names: ["cpu_percent", "memory_percent", "storage_percent", "active_connections"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  // Caching
+  "microsoft.cache/redis": {
+    names: ["percentProcessorTime", "usedmemorypercentage", "serverLoad", "cacheRead", "cacheWrite", "connectedclients"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  // Storage
+  "microsoft.storage/storageaccounts": {
+    names: ["Availability", "SuccessE2ELatency", "SuccessServerLatency", "Transactions"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  // Networking
+  "microsoft.network/applicationgateways": {
+    names: ["TotalRequests", "FailedRequests", "ResponseStatus", "HealthyHostCount", "UnhealthyHostCount", "BackendResponseStatus"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  "microsoft.network/loadbalancers": {
+    names: ["SnatConnectionCount", "AllocatedSnatPorts", "UsedSnatPorts", "DipAvailability", "VipAvailability"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  "microsoft.network/azurefirewalls": {
+    names: ["Throughput", "ApplicationRuleHit", "NetworkRuleHit", "FirewallHealth"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  "microsoft.cdn/profiles": {
+    names: ["RequestCount", "ByteHitRatio", "OriginHealthPercentage", "TotalLatency"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  // Messaging
+  "microsoft.servicebus/namespaces": {
+    names: ["IncomingRequests", "ServerErrors", "ThrottledRequests", "ActiveMessages", "DeadletteredMessages"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  "microsoft.eventhub/namespaces": {
+    names: ["IncomingRequests", "ServerErrors", "ThrottledRequests", "OutgoingMessages", "IncomingBytes"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  // AI & API
+  "microsoft.cognitiveservices/accounts": {
+    names: ["TotalCalls", "TotalErrors", "Latency", "SuccessRate"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  "microsoft.apimanagement/service": {
+    names: ["TotalRequests", "FailedRequests", "UnauthorizedRequests", "BackendDuration", "Capacity"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  // Security
+  "microsoft.keyvault/vaults": {
+    names: ["ServiceApiHit", "ServiceApiLatency", "Availability", "SaturationShoebox"],
+    warningPct: 80,
+    criticalPct: 90
+  },
+  // SignalR
+  "microsoft.signalrservice/signalr": {
+    names: ["ConnectionCount", "MessageCount", "ServerLoad", "ConnectionCloseCount"],
+    warningPct: 80,
+    criticalPct: 90
+  }
+};
+var DEPENDENCY_MAP = {
+  "microsoft.web/sites": [
     {
-      resource: external_exports.string().describe("Resource name or full Azure resource ID"),
-      subscription: external_exports.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
-      resourceGroup: external_exports.string().optional().describe("Resource group name (helps resolve resource ID faster)"),
-      timeframeHours: external_exports.number().default(24).describe("How many hours back to investigate"),
-      symptom: external_exports.string().optional().describe(
-        'User-described symptom (e.g., "slow", "500 errors", "unreachable")'
-      )
+      description: "Databases (SQL, MySQL, PostgreSQL, Cosmos DB)",
+      query: "Resources | where resourceGroup =~ '{rg}' and (type =~ 'Microsoft.Sql/servers/databases' or type =~ 'Microsoft.DocumentDB/databaseAccounts' or type =~ 'Microsoft.DBforMySQL/flexibleServers' or type =~ 'Microsoft.DBforPostgreSQL/flexibleServers') | project id, name, type"
     },
-    async ({
-      resource,
-      subscription: subParam,
-      resourceGroup,
-      timeframeHours,
-      symptom
-    }) => {
-      const subscription = await resolveSubscription(subParam);
-      const errors = [];
-      const allEvents = [];
-      let resourceId = resource;
-      let resourceType = "Unknown";
-      let resourceName = resource;
-      let resolvedResourceGroup = resourceGroup;
-      if (!resource.startsWith("/subscriptions/")) {
-        const rgFilter = resourceGroup ? `| where resourceGroup =~ '${resourceGroup}'` : "";
-        const resolveQuery = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup | take 1`;
-        const resolved = await queryResourceGraph([subscription], resolveQuery);
-        if (resolved.resources.length > 0) {
-          const r = resolved.resources[0];
-          resourceId = r.id ?? resource;
-          resourceType = r.type ?? "Unknown";
-          resourceName = r.name ?? resource;
-          resolvedResourceGroup = r.resourceGroup ?? resourceGroup;
-        } else if (resolved.error) {
-          errors.push(resolved.error);
-        }
-      } else {
-        const parts = resource.split("/");
-        resourceName = parts[parts.length - 1] ?? resource;
-        const providerIdx = parts.indexOf("providers");
-        if (providerIdx !== -1 && parts.length > providerIdx + 2) {
-          resourceType = `${parts[providerIdx + 1]}/${parts[providerIdx + 2]}`;
-        }
-        const rgIdx = parts.indexOf("resourceGroups");
-        if (rgIdx !== -1 && parts.length > rgIdx + 1) {
-          resolvedResourceGroup = parts[rgIdx + 1];
-        }
-      }
-      const metricConfig = getMetricConfig(resourceType);
-      const [healthResult, activityResult, metricsResult] = await Promise.all([
-        getResourceHealth(subscription, resourceId),
-        getActivityLogs(subscription, timeframeHours, resourceId),
-        metricConfig ? getMetrics(resourceId, metricConfig.names, timeframeHours) : Promise.resolve({ data: null, error: void 0 })
-      ]);
-      let currentHealth = "Unknown";
-      if (healthResult.error) {
-        errors.push(healthResult.error);
-      } else if (healthResult.statuses.length > 0) {
-        const status = healthResult.statuses[0];
-        currentHealth = status.properties?.availabilityState ?? "Unknown";
-        if (currentHealth !== "Available") {
-          allEvents.push({
-            time: (/* @__PURE__ */ new Date()).toISOString(),
-            event: `Health status: ${currentHealth} \u2014 ${status.properties?.summary ?? ""}`,
-            source: "ResourceHealth",
-            resource: resourceName,
-            severity: currentHealth === "Unavailable" ? "critical" : "warning"
-          });
-        }
-      }
-      if (activityResult.error) {
-        errors.push(activityResult.error);
-      } else {
-        for (const event of activityResult.events) {
-          const opName = event.operationName?.localizedValue ?? event.operationName?.value ?? "Unknown operation";
-          const status = event.status?.value ?? "";
-          const timestamp = event.eventTimestamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString();
-          allEvents.push({
-            time: timestamp,
-            event: `${opName} (${status})`,
-            source: "ActivityLog",
-            resource: resourceName,
-            actor: event.caller,
-            severity: status === "Failed" ? "warning" : "info"
-          });
-        }
-      }
-      const metricSnapshots = [];
-      const metricTrends = [];
-      if (metricsResult.error) {
-        errors.push(metricsResult.error);
-      } else if (metricsResult.data && metricConfig) {
-        for (const metric of metricsResult.data.metrics) {
-          for (const ts of metric.timeseries) {
-            if (!ts.data) continue;
-            const dataPoints = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0).map((dp) => ({
-              timestamp: dp.timeStamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString(),
-              average: dp.average ?? void 0,
-              maximum: dp.maximum ?? void 0
-            }));
-            if (dataPoints.length === 0) continue;
-            const averages = dataPoints.map((d) => d.average).filter((v) => v !== void 0);
-            const maxima = dataPoints.map((d) => d.maximum).filter((v) => v !== void 0);
-            const currentVal = averages.length > 0 ? averages[averages.length - 1] : null;
-            const maxVal = maxima.length > 0 ? Math.max(...maxima) : averages.length > 0 ? Math.max(...averages) : null;
-            const avgVal = averages.length > 0 ? averages.reduce((a, b) => a + b, 0) / averages.length : null;
-            let status = "normal";
-            if (currentVal !== null) {
-              if (currentVal >= metricConfig.criticalPct) status = "critical";
-              else if (currentVal >= metricConfig.warningPct) status = "warning";
-            }
-            const anomalies = detectMetricAnomalies(
-              resourceId,
-              metric.name,
-              dataPoints,
-              { warningPct: metricConfig.warningPct, criticalPct: metricConfig.criticalPct }
-            );
-            allEvents.push(...anomalies);
-            let trendDirection = "stable";
-            if (dataPoints.length >= 3) {
-              const trend = detectTrends(dataPoints, metric.name);
-              trendDirection = trend.trend;
-              if (trend.trend !== "stable") {
-                metricTrends.push(trend);
-              }
-            }
-            metricSnapshots.push({
-              name: metric.name,
-              current: currentVal !== null ? Math.round(currentVal * 100) / 100 : null,
-              max: maxVal !== null ? Math.round(maxVal * 100) / 100 : null,
-              avg: avgVal !== null ? Math.round(avgVal * 100) / 100 : null,
-              trend: trendDirection,
-              status
-            });
-          }
-        }
-      }
-      const dependentResources = [];
-      if (resolvedResourceGroup) {
-        const depQueries = getDependencyQueries(resourceType, resolvedResourceGroup);
-        if (depQueries.length > 0) {
-          const depResults = await Promise.all(
-            depQueries.map((dq) => queryResourceGraph([subscription], dq.query))
-          );
-          const uniqueDeps = /* @__PURE__ */ new Map();
-          for (const result of depResults) {
-            for (const dep of result.resources) {
-              const id = dep.id;
-              if (!uniqueDeps.has(id)) {
-                uniqueDeps.set(id, { id, name: dep.name, type: dep.type });
-              }
-            }
-            if (result.error) errors.push(result.error);
-          }
-          const healthChecks = await batchExecute(
-            Array.from(uniqueDeps.values()).map((dep) => async () => {
-              const depHealth = await getResourceHealth(subscription, dep.id);
-              const depState = depHealth.statuses[0]?.properties?.availabilityState ?? "Unknown";
-              return { dep, depState };
-            }),
-            5
-          );
-          for (const { dep, depState } of healthChecks) {
-            dependentResources.push({
-              name: dep.name,
-              type: dep.type,
-              health: depState,
-              concern: depState !== "Available" ? `${dep.name} is ${depState}` : void 0
-            });
-            if (depState !== "Available") {
-              allEvents.push({
-                time: (/* @__PURE__ */ new Date()).toISOString(),
-                event: `Dependent resource ${dep.name} health: ${depState}`,
-                source: "ResourceHealth",
-                resource: dep.name,
-                severity: "warning"
-              });
-            }
-          }
-        }
-      }
-      let logAnalyticsInsights = [];
-      if (resolvedResourceGroup) {
-        const wsResult = await discoverWorkspaces(subscription, resolvedResourceGroup);
-        if (wsResult.workspaces.length > 0) {
-          const wsInsights = await batchExecute(
-            wsResult.workspaces.map((ws) => async () => {
-              const errQuery = `AppRequests
-| where TimeGenerated > ago(${timeframeHours}h)
-| where Success == false
-| summarize Count = count(), AvgDuration = avg(DurationMs) by OperationName, ResultCode
-| order by Count desc
-| take 10`;
-              const errResult = await queryLogAnalytics(ws.workspaceId, errQuery, timeframeHours);
-              const excQuery = `AppExceptions
-| where TimeGenerated > ago(${timeframeHours}h)
-| summarize Count = count() by ExceptionType, OuterMessage
-| order by Count desc
-| take 5`;
-              const excResult = await queryLogAnalytics(ws.workspaceId, excQuery, timeframeHours);
-              if (errResult.error) errors.push(errResult.error);
-              if (excResult.error) errors.push(excResult.error);
-              const errRows = errResult.tables?.[0]?.rows ?? [];
-              const excRows = excResult.tables?.[0]?.rows ?? [];
-              const topErrors = errRows.map((row) => ({
-                operation: String(row[0] ?? "Unknown"),
-                message: `HTTP ${String(row[1] ?? "?")} \u2014 avg ${Math.round(Number(row[3]) || 0)}ms`,
-                count: Number(row[2]) || 0
-              }));
-              const errorCount = topErrors.reduce((sum, e) => sum + e.count, 0);
-              const recentExceptions = excRows.map(
-                (row) => `${String(row[0] ?? "Unknown")}: ${String(row[1] ?? "No message")} (${row[2]}x)`
-              );
-              return {
-                workspace: ws.workspaceName,
-                errorCount,
-                topErrors,
-                recentExceptions
-              };
-            }),
-            3
-          );
-          logAnalyticsInsights = wsInsights.filter((r) => r !== null);
-        }
-      }
-      const correlation = correlateTimelines(allEvents);
-      const diagnosticInsights = detectDiagnosticPatterns(allEvents, resourceType);
-      const likelyCause = buildLikelyCause(
-        currentHealth,
-        correlation,
-        metricSnapshots,
-        logAnalyticsInsights,
-        dependentResources,
-        symptom
-      );
-      const errorSummary = formatErrorSummary(errors);
-      const response = {
-        resource: resourceName,
-        resourceType,
-        currentHealth
-      };
-      if (metricSnapshots.length > 0) {
-        response.metrics = metricSnapshots;
-      }
-      if (logAnalyticsInsights.length > 0 && logAnalyticsInsights.some((l) => l.errorCount > 0)) {
-        response.errors_detected = logAnalyticsInsights.map((l) => ({
-          workspace: l.workspace,
-          totalErrors: l.errorCount,
-          failingEndpoints: l.topErrors,
-          exceptions: l.recentExceptions.length > 0 ? l.recentExceptions : void 0
-        }));
-      }
-      response.likelyCause = likelyCause;
-      const unhealthyDeps = dependentResources.filter((d) => d.health !== "Available");
-      const healthyDeps = dependentResources.filter((d) => d.health === "Available");
-      if (unhealthyDeps.length > 0) {
-        response.unhealthyDependencies = unhealthyDeps;
-      }
-      if (healthyDeps.length > 0) {
-        response.healthyDependencies = healthyDeps.map((d) => `${d.name} (${d.type})`);
-      }
-      if (diagnosticInsights.length > 0) {
-        response.diagnosticPatterns = diagnosticInsights;
-      }
-      const notableEvents = correlation.timeline.filter(
-        (e) => e.severity === "critical" || e.severity === "warning"
-      );
-      if (notableEvents.length > 0) {
-        response.recentChanges = notableEvents.slice(0, 10);
-      }
-      response.recommendedActions = buildRecommendations(
-        currentHealth,
-        correlation,
-        dependentResources,
-        metricSnapshots,
-        logAnalyticsInsights,
-        symptom
-      );
-      response.confidence = correlation.confidence;
-      if (errors.length > 0) {
-        response.apiErrors = errorSummary.message;
-      }
-      return {
-        content: [
-          { type: "text", text: JSON.stringify(response, null, 2) }
-        ]
-      };
+    {
+      description: "Caches (Redis)",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Cache/Redis' | project id, name, type"
+    },
+    {
+      description: "Storage accounts",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Storage/storageAccounts' | project id, name, type"
+    },
+    {
+      description: "Key Vaults",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.KeyVault/vaults' | project id, name, type"
+    },
+    {
+      description: "Service Bus / Event Hub",
+      query: "Resources | where resourceGroup =~ '{rg}' and (type =~ 'Microsoft.ServiceBus/namespaces' or type =~ 'Microsoft.EventHub/namespaces') | project id, name, type"
     }
-  );
+  ],
+  "microsoft.compute/virtualmachines": [
+    {
+      description: "Disks",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/disks' | project id, name, type"
+    },
+    {
+      description: "Network interfaces",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Network/networkInterfaces' | project id, name, type"
+    },
+    {
+      description: "Network security groups",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Network/networkSecurityGroups' | project id, name, type"
+    }
+  ],
+  "microsoft.containerservice/managedclusters": [
+    {
+      description: "Container registries",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.ContainerRegistry/registries' | project id, name, type"
+    },
+    {
+      description: "Key Vaults",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.KeyVault/vaults' | project id, name, type"
+    },
+    {
+      description: "Storage accounts",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Storage/storageAccounts' | project id, name, type"
+    }
+  ],
+  "microsoft.network/applicationgateways": [
+    {
+      description: "Backend App Services",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
+    },
+    {
+      description: "Backend VMs",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/virtualMachines' | project id, name, type"
+    }
+  ],
+  "microsoft.apimanagement/service": [
+    {
+      description: "Backend App Services",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
+    },
+    {
+      description: "Backend Functions",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' and kind contains 'functionapp' | project id, name, type"
+    }
+  ],
+  "microsoft.sql/servers/databases": [
+    {
+      description: "Dependent App Services",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
+    }
+  ],
+  "microsoft.web/serverfarms": [
+    {
+      description: "App Services on this plan",
+      query: "Resources | where type =~ 'Microsoft.Web/sites' and resourceGroup =~ '{rg}' | project id, name, type"
+    }
+  ],
+  "microsoft.cache/redis": [
+    {
+      description: "App Services (potential consumers)",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
+    }
+  ],
+  "microsoft.keyvault/vaults": [
+    {
+      description: "App Services (potential consumers)",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
+    },
+    {
+      description: "VMs (potential consumers)",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/virtualMachines' | project id, name, type"
+    }
+  ],
+  "microsoft.network/loadbalancers": [
+    {
+      description: "Backend VMs",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/virtualMachines' | project id, name, type"
+    }
+  ],
+  "microsoft.servicebus/namespaces": [
+    {
+      description: "App Services (potential consumers)",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
+    },
+    {
+      description: "Functions (potential consumers)",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' and kind contains 'functionapp' | project id, name, type"
+    }
+  ],
+  "microsoft.eventhub/namespaces": [
+    {
+      description: "App Services (potential consumers)",
+      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
+    }
+  ]
+};
+function getMetricConfig(resourceType) {
+  const base = METRIC_MAP[resourceType.toLowerCase()];
+  if (!base) return void 0;
+  const typeOverride = thresholdOverrides.perType[resourceType.toLowerCase()];
+  return {
+    names: base.names,
+    warningPct: typeOverride?.warning ?? thresholdOverrides.globalWarning ?? base.warningPct,
+    criticalPct: typeOverride?.critical ?? thresholdOverrides.globalCritical ?? base.criticalPct
+  };
 }
-function buildLikelyCause(currentHealth, correlation, metrics, logs, deps, symptom) {
-  const parts = [];
-  const totalErrors = logs.reduce((sum, l) => sum + l.errorCount, 0);
-  if (totalErrors > 0) {
-    const topError = logs.flatMap((l) => l.topErrors).sort((a, b) => b.count - a.count)[0];
-    if (topError) {
-      parts.push(
-        `${totalErrors} application errors detected. Top failing endpoint: ${topError.operation} (${topError.count}x, ${topError.message}).`
-      );
-    }
-  }
-  const criticalMetrics = metrics.filter((m) => m.status === "critical");
-  const warningMetrics = metrics.filter((m) => m.status === "warning");
-  if (criticalMetrics.length > 0) {
-    const names = criticalMetrics.map((m) => `${m.name}: ${m.current}%`).join(", ");
-    parts.push(`Critical metric thresholds breached: ${names}.`);
-  } else if (warningMetrics.length > 0) {
-    const names = warningMetrics.map((m) => `${m.name}: ${m.current}%`).join(", ");
-    parts.push(`Elevated metrics: ${names}.`);
-  }
-  if (correlation.precedingChanges.length > 0) {
-    const change = correlation.precedingChanges[correlation.precedingChanges.length - 1];
-    parts.push(
-      `A configuration change was detected before the anomaly: "${change.event}" at ${change.time}${change.actor ? ` by ${change.actor}` : ""}.`
-    );
-  }
-  const unhealthyDeps = deps.filter((d) => d.health !== "Available");
-  if (unhealthyDeps.length > 0) {
-    parts.push(
-      `Dependency issue: ${unhealthyDeps.map((d) => `${d.name} is ${d.health}`).join(", ")}.`
-    );
-  }
-  if (currentHealth === "Unavailable") {
-    parts.unshift(`Resource is currently Unavailable.`);
-  } else if (currentHealth === "Degraded") {
-    parts.unshift(`Resource is currently Degraded.`);
-  }
-  if (parts.length === 0) {
-    if (currentHealth === "Available" && totalErrors === 0) {
-      return "No issues detected. The resource appears healthy with no recent errors or metric anomalies.";
-    }
-    return "Unable to determine root cause from available signals. Consider checking application-level logs or expanding the investigation window.";
-  }
-  return parts.join(" ");
-}
-function buildRecommendations(currentHealth, correlation, deps, metrics, logs, symptom) {
-  const actions = [];
-  const totalErrors = logs.reduce((sum, l) => sum + l.errorCount, 0);
-  if (totalErrors > 0) {
-    const topEndpoints = logs.flatMap((l) => l.topErrors).sort((a, b) => b.count - a.count).slice(0, 3);
-    for (const ep of topEndpoints) {
-      actions.push(`Investigate ${ep.operation} \u2014 ${ep.count} failures detected.`);
-    }
-  }
-  if (correlation.precedingChanges.length > 0) {
-    actions.push("Review and potentially roll back the recent configuration change.");
-  }
-  const criticalMetrics = metrics.filter((m) => m.status === "critical");
-  for (const m of criticalMetrics) {
-    if (m.name.toLowerCase().includes("cpu")) {
-      actions.push(`CPU is at ${m.current}% \u2014 consider scaling up or optimizing workload.`);
-    } else if (m.name.toLowerCase().includes("memory")) {
-      actions.push(`Memory is at ${m.current}% \u2014 check for memory leaks or increase memory allocation.`);
-    } else if (m.name.toLowerCase().includes("dtu") || m.name.toLowerCase().includes("cpu") && m.name.toLowerCase().includes("sql")) {
-      actions.push(`Database DTU/CPU at ${m.current}% \u2014 consider scaling the database tier.`);
-    } else {
-      actions.push(`${m.name} is at ${m.current}% \u2014 investigate and consider scaling.`);
-    }
-  }
-  const unhealthyDeps = deps.filter((d) => d.health !== "Available");
-  for (const dep of unhealthyDeps) {
-    actions.push(`Investigate dependency ${dep.name} \u2014 currently ${dep.health}.`);
-  }
-  if (currentHealth === "Unavailable" || currentHealth === "Degraded") {
-    actions.push("Check Azure Service Health for platform incidents in this region.");
-  }
-  if (actions.length === 0) {
-    actions.push("No immediate action required \u2014 resource appears healthy.");
-  }
-  return actions;
+function getDependencyQueries(resourceType, resourceGroup) {
+  const queries = DEPENDENCY_MAP[resourceType.toLowerCase()];
+  if (!queries) return [];
+  return queries.map((q) => ({
+    ...q,
+    query: q.query.replace(/\{rg\}/g, resourceGroup)
+  }));
 }
 
 // src/tools/rca.ts

@@ -11,36 +11,11 @@ import {
   queryLogAnalytics,
 } from "../utils/azure-client.js";
 import type { AzureError } from "../utils/azure-client.js";
-import {
-  correlateTimelines,
-  detectMetricAnomalies,
-  detectDiagnosticPatterns,
-  detectTrends,
-} from "../utils/correlator.js";
-import type { DiagnosticEvent, DiagnosticInsight, TrendResult } from "../utils/correlator.js";
-import { getMetricConfig, getDependencyQueries } from "../utils/metric-config.js";
-import { formatErrorSummary } from "../utils/formatters.js";
-
-interface DependentResource {
-  name: string;
-  type: string;
-  health: string;
-  concern?: string;
-}
-
-interface MetricSnapshot {
-  name: string;
-  current: number | null;
-  max: number | null;
-  avg: number | null;
-  trend: string;
-  status: "normal" | "warning" | "critical";
-}
 
 export function registerInvestigate(server: McpServer): void {
   server.tool(
     "azdoctor_investigate",
-    "Investigate a specific Azure resource or incident. Performs multi-signal correlation across Resource Health, Activity Logs, Metrics, and dependent resources to identify root cause.",
+    "Investigate an Azure resource by gathering data from Resource Health, Activity Logs, Metrics, Log Analytics, and dependent resources. Returns comprehensive raw diagnostic data for analysis.",
     {
       resource: z
         .string()
@@ -57,32 +32,21 @@ export function registerInvestigate(server: McpServer): void {
       symptom: z
         .string()
         .optional()
-        .describe(
-          'User-described symptom (e.g., "slow", "500 errors", "unreachable")'
-        ),
+        .describe('User-described symptom (e.g., "slow", "500 errors", "unreachable")'),
     },
-    async ({
-      resource,
-      subscription: subParam,
-      resourceGroup,
-      timeframeHours,
-      symptom,
-    }) => {
+    async ({ resource, subscription: subParam, resourceGroup, timeframeHours, symptom }) => {
       const subscription = await resolveSubscription(subParam);
       const errors: AzureError[] = [];
-      const allEvents: DiagnosticEvent[] = [];
 
-      // 1. Resolve resource ID from name if needed
+      // 1. Resolve resource
       let resourceId = resource;
       let resourceType = "Unknown";
       let resourceName = resource;
       let resolvedResourceGroup = resourceGroup;
 
       if (!resource.startsWith("/subscriptions/")) {
-        const rgFilter = resourceGroup
-          ? `| where resourceGroup =~ '${resourceGroup}'`
-          : "";
-        const resolveQuery = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup | take 1`;
+        const rgFilter = resourceGroup ? `| where resourceGroup =~ '${resourceGroup}'` : "";
+        const resolveQuery = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup, properties | take 1`;
         const resolved = await queryResourceGraph([subscription], resolveQuery);
         if (resolved.resources.length > 0) {
           const r = resolved.resources[0];
@@ -106,314 +70,288 @@ export function registerInvestigate(server: McpServer): void {
         }
       }
 
-      // 2-5: Gather signals in parallel
-      const metricConfig = getMetricConfig(resourceType);
+      // 2. For App Services, resolve the hosting plan (CPU/memory metrics live there)
+      let appServicePlanId: string | null = null;
+      if (resourceType.toLowerCase() === "microsoft.web/sites") {
+        const planQuery = `Resources | where type =~ 'microsoft.web/sites' and name =~ '${resourceName}' ${resolvedResourceGroup ? `and resourceGroup =~ '${resolvedResourceGroup}'` : ""} | project serverFarmId = properties.serverFarmId | take 1`;
+        const planResult = await queryResourceGraph([subscription], planQuery);
+        if (planResult.resources.length > 0) {
+          appServicePlanId = planResult.resources[0]["serverFarmId"] as string ?? null;
+        }
+      }
 
-      const [healthResult, activityResult, metricsResult] =
-        await Promise.all([
-          getResourceHealth(subscription, resourceId),
-          getActivityLogs(subscription, timeframeHours, resourceId),
-          metricConfig
-            ? getMetrics(resourceId, metricConfig.names, timeframeHours)
-            : Promise.resolve({ data: null, error: undefined }),
-        ]);
+      // 3. Gather ALL signals in parallel
+      const metricPromises: Array<{ label: string; promise: ReturnType<typeof getMetrics> }> = [];
 
-      // Process health result
+      // Site-level metrics (HTTP errors, response time, requests)
+      if (resourceType.toLowerCase() === "microsoft.web/sites") {
+        metricPromises.push({
+          label: `${resourceName} (site)`,
+          promise: getMetrics(resourceId, ["Http5xx", "Http4xx", "Http2xx", "HttpResponseTime", "Requests", "HealthCheckStatus"], timeframeHours, "PT5M"),
+        });
+        // Plan-level metrics (CPU, memory)
+        if (appServicePlanId) {
+          metricPromises.push({
+            label: `${resourceName} (plan)`,
+            promise: getMetrics(appServicePlanId, ["CpuPercentage", "MemoryPercentage"], timeframeHours, "PT5M"),
+          });
+        }
+      } else {
+        // Generic: use standard metric names for the resource type
+        const RESOURCE_METRICS: Record<string, string[]> = {
+          "microsoft.sql/servers/databases": ["dtu_consumption_percent", "cpu_percent", "connection_failed", "deadlock", "storage_percent"],
+          "microsoft.compute/virtualmachines": ["Percentage CPU", "Available Memory Bytes", "Disk Read Bytes/sec", "Disk Write Bytes/sec", "Network In Total", "Network Out Total"],
+          "microsoft.cache/redis": ["percentProcessorTime", "usedmemorypercentage", "connectedclients", "totalcommandsprocessed", "cacheRead", "cacheWrite"],
+          "microsoft.documentdb/databaseaccounts": ["TotalRequests", "TotalRequestUnits", "ProvisionedThroughput", "ServiceAvailability"],
+        };
+        const metricNames = RESOURCE_METRICS[resourceType.toLowerCase()];
+        if (metricNames) {
+          metricPromises.push({
+            label: resourceName,
+            promise: getMetrics(resourceId, metricNames, timeframeHours, "PT5M"),
+          });
+        }
+      }
+
+      const [healthResult, activityResult, ...metricResults] = await Promise.all([
+        getResourceHealth(subscription, resourceId),
+        getActivityLogs(subscription, timeframeHours, resourceId),
+        ...metricPromises.map((m) => m.promise),
+      ]);
+
+      // 4. Process health
       let currentHealth = "Unknown";
+      let healthDetails: Record<string, unknown> | undefined;
       if (healthResult.error) {
         errors.push(healthResult.error);
       } else if (healthResult.statuses.length > 0) {
         const status = healthResult.statuses[0];
-        currentHealth =
-          status.properties?.availabilityState ?? "Unknown";
-
+        currentHealth = status.properties?.availabilityState ?? "Unknown";
         if (currentHealth !== "Available") {
-          allEvents.push({
-            time: new Date().toISOString(),
-            event: `Health status: ${currentHealth} — ${status.properties?.summary ?? ""}`,
-            source: "ResourceHealth",
-            resource: resourceName,
-            severity:
-              currentHealth === "Unavailable" ? "critical" : "warning",
-          });
+          healthDetails = {
+            state: currentHealth,
+            summary: status.properties?.summary,
+            reason: status.properties?.reasonType,
+            detailedStatus: status.properties?.detailedStatus,
+            recommendedAction: status.properties?.recommendedActions?.[0]?.action,
+          };
         }
       }
 
-      // Process activity log
+      // 5. Process activity log — only notable events
+      const activityEvents: Array<Record<string, unknown>> = [];
       if (activityResult.error) {
         errors.push(activityResult.error);
       } else {
         for (const event of activityResult.events) {
-          const opName =
-            event.operationName?.localizedValue ??
-            event.operationName?.value ??
-            "Unknown operation";
           const status = event.status?.value ?? "";
-          const timestamp = event.eventTimestamp?.toISOString() ?? new Date().toISOString();
-
-          allEvents.push({
-            time: timestamp,
-            event: `${opName} (${status})`,
-            source: "ActivityLog",
-            resource: resourceName,
-            actor: event.caller,
-            severity:
-              status === "Failed" ? "warning" : "info",
-          });
-        }
-      }
-
-      // Process metrics — build snapshots with current values AND detect trends
-      const metricSnapshots: MetricSnapshot[] = [];
-      const metricTrends: TrendResult[] = [];
-
-      if (metricsResult.error) {
-        errors.push(metricsResult.error);
-      } else if (metricsResult.data && metricConfig) {
-        for (const metric of metricsResult.data.metrics) {
-          for (const ts of metric.timeseries) {
-            if (!ts.data) continue;
-            const dataPoints = ts.data
-              .filter((dp) => dp.average !== undefined || dp.maximum !== undefined)
-              .map((dp) => ({
-                timestamp:
-                  (dp as unknown as { timeStamp: Date }).timeStamp?.toISOString() ??
-                  new Date().toISOString(),
-                average: dp.average ?? undefined,
-                maximum: dp.maximum ?? undefined,
-              }));
-
-            if (dataPoints.length === 0) continue;
-
-            // Compute summary stats
-            const averages = dataPoints.map((d) => d.average).filter((v): v is number => v !== undefined);
-            const maxima = dataPoints.map((d) => d.maximum).filter((v): v is number => v !== undefined);
-
-            const currentVal = averages.length > 0 ? averages[averages.length - 1] : null;
-            const maxVal = maxima.length > 0 ? Math.max(...maxima) : (averages.length > 0 ? Math.max(...averages) : null);
-            const avgVal = averages.length > 0 ? averages.reduce((a, b) => a + b, 0) / averages.length : null;
-
-            // Determine status based on thresholds
-            let status: "normal" | "warning" | "critical" = "normal";
-            if (currentVal !== null) {
-              if (currentVal >= metricConfig.criticalPct) status = "critical";
-              else if (currentVal >= metricConfig.warningPct) status = "warning";
-            }
-
-            // Detect anomalies
-            const anomalies = detectMetricAnomalies(
-              resourceId, metric.name, dataPoints,
-              { warningPct: metricConfig.warningPct, criticalPct: metricConfig.criticalPct }
-            );
-            allEvents.push(...anomalies);
-
-            // Detect trend
-            let trendDirection = "stable";
-            if (dataPoints.length >= 3) {
-              const trend = detectTrends(dataPoints, metric.name);
-              trendDirection = trend.trend;
-              if (trend.trend !== "stable") {
-                metricTrends.push(trend);
-              }
-            }
-
-            metricSnapshots.push({
-              name: metric.name,
-              current: currentVal !== null ? Math.round(currentVal * 100) / 100 : null,
-              max: maxVal !== null ? Math.round(maxVal * 100) / 100 : null,
-              avg: avgVal !== null ? Math.round(avgVal * 100) / 100 : null,
-              trend: trendDirection,
+          // Only include writes, failures, and deployments — skip reads
+          if (status === "Failed" || event.operationName?.value?.includes("write") || event.operationName?.value?.includes("deploy") || event.operationName?.value?.includes("restart") || event.operationName?.value?.includes("delete")) {
+            activityEvents.push({
+              time: event.eventTimestamp?.toISOString(),
+              operation: event.operationName?.localizedValue ?? event.operationName?.value,
               status,
+              caller: event.caller,
             });
           }
         }
       }
 
-      // 6. Identify dependent resources
-      const dependentResources: DependentResource[] = [];
-      if (resolvedResourceGroup) {
-        const depQueries = getDependencyQueries(resourceType, resolvedResourceGroup);
-        if (depQueries.length > 0) {
-          const depResults = await Promise.all(
-            depQueries.map((dq) => queryResourceGraph([subscription], dq.query))
-          );
+      // 6. Process metrics — extract actual values
+      interface MetricSummary {
+        name: string;
+        source: string;
+        current: number | null;
+        max: number;
+        avg: number;
+        min: number;
+        dataPoints: number;
+        recentValues: Array<{ time: string; value: number }>;
+      }
+      const metricSummaries: MetricSummary[] = [];
 
-          const uniqueDeps = new Map<string, { id: string; name: string; type: string }>();
-          for (const result of depResults) {
-            for (const dep of result.resources) {
-              const id = dep.id as string;
-              if (!uniqueDeps.has(id)) {
-                uniqueDeps.set(id, { id, name: dep.name as string, type: dep.type as string });
-              }
-            }
-            if (result.error) errors.push(result.error);
+      for (let i = 0; i < metricResults.length; i++) {
+        const result = metricResults[i];
+        const label = metricPromises[i]?.label ?? "unknown";
+        if (result.error) {
+          errors.push(result.error);
+          continue;
+        }
+        if (!result.data) continue;
+
+        for (const metric of result.data.metrics) {
+          for (const ts of metric.timeseries) {
+            if (!ts.data) continue;
+            const points = ts.data
+              .filter((dp) => dp.average !== undefined || dp.maximum !== undefined)
+              .map((dp) => ({
+                time: (dp as unknown as { timeStamp: Date }).timeStamp?.toISOString() ?? "",
+                avg: dp.average ?? 0,
+                max: dp.maximum ?? 0,
+              }));
+
+            if (points.length === 0) continue;
+
+            const avgs = points.map((p) => p.avg);
+            const maxes = points.map((p) => p.max);
+            const current = avgs[avgs.length - 1];
+            const overall_avg = avgs.reduce((a, b) => a + b, 0) / avgs.length;
+            const overall_max = Math.max(...maxes);
+            const overall_min = Math.min(...avgs);
+
+            // Last 6 data points (30 min at 5min granularity) for recent trend
+            const recent = points.slice(-6).map((p) => ({
+              time: p.time,
+              value: Math.round(p.avg * 100) / 100,
+            }));
+
+            metricSummaries.push({
+              name: metric.name,
+              source: label,
+              current: Math.round(current * 100) / 100,
+              max: Math.round(overall_max * 100) / 100,
+              avg: Math.round(overall_avg * 100) / 100,
+              min: Math.round(overall_min * 100) / 100,
+              dataPoints: points.length,
+              recentValues: recent,
+            });
           }
+        }
+      }
 
+      // 7. Discover dependencies and check their health
+      interface DepHealth { name: string; type: string; health: string }
+      const dependencies: DepHealth[] = [];
+      if (resolvedResourceGroup) {
+        // Find related resources — databases, caches, storage, etc.
+        const depQuery = `Resources | where resourceGroup =~ '${resolvedResourceGroup}' and name != '${resourceName}' and (type =~ 'Microsoft.Sql/servers/databases' or type =~ 'Microsoft.DocumentDB/databaseAccounts' or type =~ 'Microsoft.Cache/Redis' or type =~ 'Microsoft.Storage/storageAccounts' or type =~ 'Microsoft.KeyVault/vaults' or type =~ 'Microsoft.ServiceBus/namespaces' or type =~ 'Microsoft.EventHub/namespaces') | project id, name, type`;
+        const depResult = await queryResourceGraph([subscription], depQuery);
+        if (depResult.error) errors.push(depResult.error);
+
+        const uniqueDeps = new Map<string, { id: string; name: string; type: string }>();
+        for (const dep of depResult.resources) {
+          const id = dep.id as string;
+          if (!uniqueDeps.has(id)) {
+            uniqueDeps.set(id, { id, name: dep.name as string, type: dep.type as string });
+          }
+        }
+
+        if (uniqueDeps.size > 0) {
           const healthChecks = await batchExecute(
             Array.from(uniqueDeps.values()).map((dep) => async () => {
-              const depHealth = await getResourceHealth(subscription, dep.id);
-              const depState =
-                depHealth.statuses[0]?.properties?.availabilityState ?? "Unknown";
-              return { dep, depState };
+              const h = await getResourceHealth(subscription, dep.id);
+              return { name: dep.name, type: dep.type, health: h.statuses[0]?.properties?.availabilityState ?? "Unknown" };
             }),
             5
           );
-
-          for (const { dep, depState } of healthChecks) {
-            dependentResources.push({
-              name: dep.name,
-              type: dep.type,
-              health: depState,
-              concern: depState !== "Available" ? `${dep.name} is ${depState}` : undefined,
-            });
-            if (depState !== "Available") {
-              allEvents.push({
-                time: new Date().toISOString(),
-                event: `Dependent resource ${dep.name} health: ${depState}`,
-                source: "ResourceHealth",
-                resource: dep.name,
-                severity: "warning",
-              });
-            }
-          }
+          dependencies.push(...healthChecks);
         }
       }
 
-      // 7. Log Analytics — get actual error details, not just counts
-      interface LogInsight {
+      // 8. Log Analytics — get real error details
+      interface LogData {
         workspace: string;
-        errorCount: number;
-        topErrors: Array<{ operation: string; message: string; count: number }>;
-        recentExceptions: string[];
+        failedRequests: Array<{ operation: string; statusCode: string; count: number; avgDurationMs: number }>;
+        exceptions: Array<{ type: string; message: string; count: number }>;
+        dependencyFailures: Array<{ target: string; type: string; resultCode: string; count: number; avgDurationMs: number }>;
       }
-      let logAnalyticsInsights: LogInsight[] = [];
+      let logData: LogData | null = null;
 
       if (resolvedResourceGroup) {
         const wsResult = await discoverWorkspaces(subscription, resolvedResourceGroup);
         if (wsResult.workspaces.length > 0) {
-          const wsInsights = await batchExecute(
-            wsResult.workspaces.map((ws) => async () => {
-              // Query 1: Top failing operations with error details
-              const errQuery = `AppRequests
+          const ws = wsResult.workspaces[0]; // Use primary workspace
+
+          const [reqResult, excResult, depResult] = await Promise.all([
+            // Failed requests with status codes and duration
+            queryLogAnalytics(ws.workspaceId, `AppRequests
 | where TimeGenerated > ago(${timeframeHours}h)
 | where Success == false
-| summarize Count = count(), AvgDuration = avg(DurationMs) by OperationName, ResultCode
+| summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by OperationName, ResultCode
 | order by Count desc
-| take 10`;
-              const errResult = await queryLogAnalytics(ws.workspaceId, errQuery, timeframeHours);
-
-              // Query 2: Recent exception messages
-              const excQuery = `AppExceptions
+| take 10`, timeframeHours),
+            // Exception details
+            queryLogAnalytics(ws.workspaceId, `AppExceptions
 | where TimeGenerated > ago(${timeframeHours}h)
 | summarize Count = count() by ExceptionType, OuterMessage
 | order by Count desc
-| take 5`;
-              const excResult = await queryLogAnalytics(ws.workspaceId, excQuery, timeframeHours);
+| take 10`, timeframeHours),
+            // Dependency failures (SQL calls, HTTP calls, etc.)
+            queryLogAnalytics(ws.workspaceId, `AppDependencies
+| where TimeGenerated > ago(${timeframeHours}h)
+| where Success == false
+| summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by Target, DependencyType = Type, ResultCode
+| order by Count desc
+| take 10`, timeframeHours),
+          ]);
 
-              if (errResult.error) errors.push(errResult.error);
-              if (excResult.error) errors.push(excResult.error);
+          if (reqResult.error) errors.push(reqResult.error);
+          if (excResult.error) errors.push(excResult.error);
+          if (depResult.error) errors.push(depResult.error);
 
-              const errRows = errResult.tables?.[0]?.rows ?? [];
-              const excRows = excResult.tables?.[0]?.rows ?? [];
+          const failedRequests = (reqResult.tables?.[0]?.rows ?? []).map((r) => ({
+            operation: String(r[0] ?? ""),
+            statusCode: String(r[1] ?? ""),
+            count: Number(r[2]) || 0,
+            avgDurationMs: Number(r[3]) || 0,
+          }));
 
-              const topErrors = errRows.map((row) => ({
-                operation: String(row[0] ?? "Unknown"),
-                message: `HTTP ${String(row[1] ?? "?")} — avg ${Math.round(Number(row[3]) || 0)}ms`,
-                count: Number(row[2]) || 0,
-              }));
+          const exceptions = (excResult.tables?.[0]?.rows ?? []).map((r) => ({
+            type: String(r[0] ?? ""),
+            message: String(r[1] ?? ""),
+            count: Number(r[2]) || 0,
+          }));
 
-              const errorCount = topErrors.reduce((sum, e) => sum + e.count, 0);
+          const dependencyFailures = (depResult.tables?.[0]?.rows ?? []).map((r) => ({
+            target: String(r[0] ?? ""),
+            type: String(r[1] ?? ""),
+            resultCode: String(r[2] ?? ""),
+            count: Number(r[3]) || 0,
+            avgDurationMs: Number(r[4]) || 0,
+          }));
 
-              const recentExceptions = excRows.map((row) =>
-                `${String(row[0] ?? "Unknown")}: ${String(row[1] ?? "No message")} (${row[2]}x)`
-              );
-
-              return {
-                workspace: ws.workspaceName,
-                errorCount,
-                topErrors,
-                recentExceptions,
-              } as LogInsight;
-            }),
-            3
-          );
-          logAnalyticsInsights = wsInsights.filter((r): r is NonNullable<typeof r> => r !== null);
+          logData = {
+            workspace: ws.workspaceName,
+            failedRequests,
+            exceptions,
+            dependencyFailures,
+          };
         }
       }
 
-      // 8. Correlate timestamps across all signals
-      const correlation = correlateTimelines(allEvents);
-
-      // 9. Detect service-specific diagnostic patterns
-      const diagnosticInsights: DiagnosticInsight[] = detectDiagnosticPatterns(allEvents, resourceType);
-
-      // 10. Build a smart likely cause that uses ALL signals
-      const likelyCause = buildLikelyCause(
-        currentHealth, correlation, metricSnapshots, logAnalyticsInsights, dependentResources, symptom
-      );
-
-      // 11. Build investigation output — lead with what matters
-      const errorSummary = formatErrorSummary(errors);
-
-      // Only include fields that have meaningful data
+      // 9. Build response — raw data, no opinions
       const response: Record<string, unknown> = {
         resource: resourceName,
         resourceType,
+        resourceGroup: resolvedResourceGroup,
         currentHealth,
       };
 
-      // Metrics — always include if we have data
-      if (metricSnapshots.length > 0) {
-        response.metrics = metricSnapshots;
+      if (healthDetails) response.healthDetails = healthDetails;
+      if (symptom) response.reportedSymptom = symptom;
+
+      if (metricSummaries.length > 0) {
+        response.metrics = metricSummaries;
+      } else {
+        response.metrics = "No metric data available — check if the resource emits metrics or if the timeframe is too narrow.";
       }
 
-      // Errors from logs — the most actionable data
-      if (logAnalyticsInsights.length > 0 && logAnalyticsInsights.some((l) => l.errorCount > 0)) {
-        response.errors_detected = logAnalyticsInsights.map((l) => ({
-          workspace: l.workspace,
-          totalErrors: l.errorCount,
-          failingEndpoints: l.topErrors,
-          exceptions: l.recentExceptions.length > 0 ? l.recentExceptions : undefined,
-        }));
+      if (activityEvents.length > 0) {
+        response.recentChanges = activityEvents;
+      } else {
+        response.recentChanges = "No write operations or failures in the activity log for the investigation window.";
       }
 
-      // Likely cause — the diagnosis
-      response.likelyCause = likelyCause;
-
-      // Dependencies — only non-healthy ones prominently, rest as summary
-      const unhealthyDeps = dependentResources.filter((d) => d.health !== "Available");
-      const healthyDeps = dependentResources.filter((d) => d.health === "Available");
-      if (unhealthyDeps.length > 0) {
-        response.unhealthyDependencies = unhealthyDeps;
-      }
-      if (healthyDeps.length > 0) {
-        response.healthyDependencies = healthyDeps.map((d) => `${d.name} (${d.type})`);
+      if (logData) {
+        response.logAnalytics = logData;
       }
 
-      // Diagnostic patterns — only if detected
-      if (diagnosticInsights.length > 0) {
-        response.diagnosticPatterns = diagnosticInsights;
+      if (dependencies.length > 0) {
+        response.dependencies = dependencies;
       }
 
-      // Activity — only failed or notable changes
-      const notableEvents = correlation.timeline.filter(
-        (e) => e.severity === "critical" || e.severity === "warning"
-      );
-      if (notableEvents.length > 0) {
-        response.recentChanges = notableEvents.slice(0, 10);
-      }
-
-      // Recommendations
-      response.recommendedActions = buildRecommendations(
-        currentHealth, correlation, dependentResources, metricSnapshots, logAnalyticsInsights, symptom
-      );
-
-      // Confidence
-      response.confidence = correlation.confidence;
-
-      // API errors (if any)
       if (errors.length > 0) {
-        response.apiErrors = errorSummary.message;
+        response.apiErrors = errors.map((e) => `${e.code}: ${e.message}`);
       }
 
       return {
@@ -423,125 +361,4 @@ export function registerInvestigate(server: McpServer): void {
       };
     }
   );
-}
-
-function buildLikelyCause(
-  currentHealth: string,
-  correlation: ReturnType<typeof correlateTimelines>,
-  metrics: MetricSnapshot[],
-  logs: Array<{ errorCount: number; topErrors: Array<{ operation: string; message: string; count: number }> }>,
-  deps: DependentResource[],
-  symptom?: string
-): string {
-  const parts: string[] = [];
-
-  // Check for application errors first — most actionable
-  const totalErrors = logs.reduce((sum, l) => sum + l.errorCount, 0);
-  if (totalErrors > 0) {
-    const topError = logs.flatMap((l) => l.topErrors).sort((a, b) => b.count - a.count)[0];
-    if (topError) {
-      parts.push(
-        `${totalErrors} application errors detected. Top failing endpoint: ${topError.operation} (${topError.count}x, ${topError.message}).`
-      );
-    }
-  }
-
-  // Check for metric anomalies
-  const criticalMetrics = metrics.filter((m) => m.status === "critical");
-  const warningMetrics = metrics.filter((m) => m.status === "warning");
-  if (criticalMetrics.length > 0) {
-    const names = criticalMetrics.map((m) => `${m.name}: ${m.current}%`).join(", ");
-    parts.push(`Critical metric thresholds breached: ${names}.`);
-  } else if (warningMetrics.length > 0) {
-    const names = warningMetrics.map((m) => `${m.name}: ${m.current}%`).join(", ");
-    parts.push(`Elevated metrics: ${names}.`);
-  }
-
-  // Check for preceding changes
-  if (correlation.precedingChanges.length > 0) {
-    const change = correlation.precedingChanges[correlation.precedingChanges.length - 1];
-    parts.push(
-      `A configuration change was detected before the anomaly: "${change.event}" at ${change.time}${change.actor ? ` by ${change.actor}` : ""}.`
-    );
-  }
-
-  // Check for unhealthy dependencies
-  const unhealthyDeps = deps.filter((d) => d.health !== "Available");
-  if (unhealthyDeps.length > 0) {
-    parts.push(
-      `Dependency issue: ${unhealthyDeps.map((d) => `${d.name} is ${d.health}`).join(", ")}.`
-    );
-  }
-
-  // Check health status
-  if (currentHealth === "Unavailable") {
-    parts.unshift(`Resource is currently Unavailable.`);
-  } else if (currentHealth === "Degraded") {
-    parts.unshift(`Resource is currently Degraded.`);
-  }
-
-  if (parts.length === 0) {
-    if (currentHealth === "Available" && totalErrors === 0) {
-      return "No issues detected. The resource appears healthy with no recent errors or metric anomalies.";
-    }
-    return "Unable to determine root cause from available signals. Consider checking application-level logs or expanding the investigation window.";
-  }
-
-  return parts.join(" ");
-}
-
-function buildRecommendations(
-  currentHealth: string,
-  correlation: ReturnType<typeof correlateTimelines>,
-  deps: DependentResource[],
-  metrics: MetricSnapshot[],
-  logs: Array<{ errorCount: number; topErrors: Array<{ operation: string; count: number }> }>,
-  symptom?: string
-): string[] {
-  const actions: string[] = [];
-
-  // Errors → investigate the failing endpoints
-  const totalErrors = logs.reduce((sum, l) => sum + l.errorCount, 0);
-  if (totalErrors > 0) {
-    const topEndpoints = logs.flatMap((l) => l.topErrors).sort((a, b) => b.count - a.count).slice(0, 3);
-    for (const ep of topEndpoints) {
-      actions.push(`Investigate ${ep.operation} — ${ep.count} failures detected.`);
-    }
-  }
-
-  // Preceding changes → suggest rollback
-  if (correlation.precedingChanges.length > 0) {
-    actions.push("Review and potentially roll back the recent configuration change.");
-  }
-
-  // Critical metrics → resource-specific advice
-  const criticalMetrics = metrics.filter((m) => m.status === "critical");
-  for (const m of criticalMetrics) {
-    if (m.name.toLowerCase().includes("cpu")) {
-      actions.push(`CPU is at ${m.current}% — consider scaling up or optimizing workload.`);
-    } else if (m.name.toLowerCase().includes("memory")) {
-      actions.push(`Memory is at ${m.current}% — check for memory leaks or increase memory allocation.`);
-    } else if (m.name.toLowerCase().includes("dtu") || m.name.toLowerCase().includes("cpu") && m.name.toLowerCase().includes("sql")) {
-      actions.push(`Database DTU/CPU at ${m.current}% — consider scaling the database tier.`);
-    } else {
-      actions.push(`${m.name} is at ${m.current}% — investigate and consider scaling.`);
-    }
-  }
-
-  // Unhealthy dependencies
-  const unhealthyDeps = deps.filter((d) => d.health !== "Available");
-  for (const dep of unhealthyDeps) {
-    actions.push(`Investigate dependency ${dep.name} — currently ${dep.health}.`);
-  }
-
-  // Resource health
-  if (currentHealth === "Unavailable" || currentHealth === "Degraded") {
-    actions.push("Check Azure Service Health for platform incidents in this region.");
-  }
-
-  if (actions.length === 0) {
-    actions.push("No immediate action required — resource appears healthy.");
-  }
-
-  return actions;
 }
