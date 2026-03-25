@@ -235,35 +235,130 @@ export function registerInvestigate(server: McpServer): void {
         }
       }
 
-      // ── 7. Discover dependencies via Resource Graph ──────────────────
-      interface DepHealth { name: string; type: string; health: string }
+      // ── 7. Discover ACTUAL dependencies ─────────────────────────────
+      // Don't just grab everything in the RG — find resources this resource
+      // actually connects to based on its configuration.
+      interface DepHealth { name: string; type: string; health: string; relationship: string }
       const dependencies: DepHealth[] = [];
 
       if (resolvedRG) {
-        // Find all resources in the same RG that aren't the target and aren't infrastructure noise
-        const depQuery = `Resources
+        const depResourceIds: Array<{ id: string; name: string; type: string; relationship: string }> = [];
+
+        if (resourceType.toLowerCase() === "microsoft.web/sites") {
+          // For App Services: check app settings and connection strings for references
+          // to SQL servers, Redis, Cosmos, Storage, etc.
+          const configQuery = `Resources
+| where type =~ 'microsoft.web/sites' and name =~ '${resourceName}' and resourceGroup =~ '${resolvedRG}'
+| project siteConfig = properties.siteConfig, serverFarmId = properties.serverFarmId
+| take 1`;
+          const configResult = await queryResourceGraph([subscription], configQuery);
+
+          // Extract referenced resource names from app settings
+          const referencedNames = new Set<string>();
+          if (configResult.resources.length > 0) {
+            const config = configResult.resources[0];
+            const siteConfig = config["siteConfig"] as Record<string, unknown> | undefined;
+            const appSettings = siteConfig?.["appSettings"] as Array<{ name: string; value: string }> | undefined;
+
+            // Scan app settings values for resource references
+            if (Array.isArray(appSettings)) {
+              for (const setting of appSettings) {
+                const val = String(setting.value ?? "");
+                // Extract server names from connection strings
+                const serverMatch = val.match(/(?:Server|Data Source|AccountEndpoint)=(?:tcp:)?([^;,]+)/i);
+                if (serverMatch) {
+                  // Extract just the hostname prefix (e.g., "sql-azdemo-prod-30bf1e4b" from "sql-azdemo-prod-30bf1e4b.database.windows.net")
+                  const host = serverMatch[1].split(".")[0];
+                  referencedNames.add(host.toLowerCase());
+                }
+                // Extract Redis host
+                const redisMatch = val.match(/([^.]+)\.redis\.cache\.windows\.net/i);
+                if (redisMatch) referencedNames.add(redisMatch[1].toLowerCase());
+                // Extract storage account
+                const storageMatch = val.match(/([^.]+)\.blob\.core\.windows\.net/i);
+                if (storageMatch) referencedNames.add(storageMatch[1].toLowerCase());
+                // Extract Cosmos
+                const cosmosMatch = val.match(/([^.]+)\.documents\.azure\.com/i);
+                if (cosmosMatch) referencedNames.add(cosmosMatch[1].toLowerCase());
+              }
+            }
+          }
+
+          if (referencedNames.size > 0) {
+            // Find the actual resources matching these names
+            const nameFilter = Array.from(referencedNames).map((n) => `name =~ '${n}'`).join(" or ");
+            const refQuery = `Resources | where (${nameFilter}) | project id, name, type | take 20`;
+            const refResult = await queryResourceGraph([subscription], refQuery);
+            if (refResult.error) errors.push(refResult.error);
+            for (const dep of refResult.resources) {
+              depResourceIds.push({
+                id: dep.id as string, name: dep.name as string,
+                type: dep.type as string, relationship: "referenced in app settings",
+              });
+            }
+
+            // Also find child resources (e.g., SQL databases under the referenced server)
+            for (const dep of [...depResourceIds]) {
+              if ((dep.type as string).toLowerCase() === "microsoft.sql/servers") {
+                const dbQuery = `Resources | where type =~ 'microsoft.sql/servers/databases' and name != 'master' and resourceGroup =~ '${resolvedRG}' and id startswith '${dep.id}' | project id, name, type`;
+                const dbResult = await queryResourceGraph([subscription], dbQuery);
+                for (const db of dbResult.resources) {
+                  depResourceIds.push({
+                    id: db.id as string, name: db.name as string,
+                    type: db.type as string, relationship: `database on ${dep.name}`,
+                  });
+                }
+              }
+            }
+          }
+
+          // If no references found in app settings, fall back to data resources in RG
+          if (depResourceIds.length === 0) {
+            const fallbackQuery = `Resources
 | where resourceGroup =~ '${resolvedRG}'
 | where name != '${resourceName}'
-| where type !in~ ('microsoft.insights/components', 'microsoft.insights/actiongroups', 'microsoft.insights/smartdetectoralertrules', 'microsoft.operationalinsights/workspaces', 'microsoft.alertsmanagement/smartdetectoralertrules', 'microsoft.network/virtualnetworks', 'microsoft.network/networkinterfaces', 'microsoft.compute/disks', 'microsoft.network/publicipaddresses', 'microsoft.network/networksecuritygroups')
+| where type in~ ('microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.servicebus/namespaces', 'microsoft.eventhub/namespaces')
+| where name != 'master'
 | project id, name, type
-| take 20`;
-        const depResult = await queryResourceGraph([subscription], depQuery);
-        if (depResult.error) errors.push(depResult.error);
+| take 10`;
+            const fallbackResult = await queryResourceGraph([subscription], fallbackQuery);
+            if (fallbackResult.error) errors.push(fallbackResult.error);
+            for (const dep of fallbackResult.resources) {
+              depResourceIds.push({
+                id: dep.id as string, name: dep.name as string,
+                type: dep.type as string, relationship: "in same resource group",
+              });
+            }
+          }
+        } else {
+          // For non-App Service resources: find data/compute resources in the same RG
+          const depQuery = `Resources
+| where resourceGroup =~ '${resolvedRG}'
+| where name != '${resourceName}'
+| where type in~ ('microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.web/sites', 'microsoft.compute/virtualmachines', 'microsoft.containerservice/managedclusters')
+| where name != 'master'
+| project id, name, type
+| take 10`;
+          const depResult = await queryResourceGraph([subscription], depQuery);
+          if (depResult.error) errors.push(depResult.error);
+          for (const dep of depResult.resources) {
+            depResourceIds.push({
+              id: dep.id as string, name: dep.name as string,
+              type: dep.type as string, relationship: "in same resource group",
+            });
+          }
+        }
 
-        const deps = depResult.resources.map((d) => ({
-          id: d.id as string,
-          name: d.name as string,
-          type: d.type as string,
-        }));
-
-        if (deps.length > 0) {
+        // Health check discovered dependencies
+        if (depResourceIds.length > 0) {
           const healthChecks = await batchExecute(
-            deps.map((dep) => async () => {
+            depResourceIds.map((dep) => async () => {
               const h = await getResourceHealth(subscription, dep.id);
               return {
                 name: dep.name,
                 type: dep.type,
                 health: h.statuses[0]?.properties?.availabilityState ?? "Unknown",
+                relationship: dep.relationship,
               };
             }),
             5
