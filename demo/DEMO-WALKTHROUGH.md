@@ -1,6 +1,6 @@
 # AZ Doctor Demo Walkthrough
 
-> "It's Monday morning. You get a Slack message — prod is slow. Here's how you go from 'something is wrong' to 'here's the RCA and we've prevented recurrence' in under 10 minutes, without leaving your terminal."
+> "It's Monday morning. You get a Slack message — prod is slow, users are seeing 500 errors. Here's how you go from 'something is wrong' to 'here's the RCA, the fix, and the alerts to prevent recurrence' — without leaving your terminal."
 
 ## Before Recording
 
@@ -10,177 +10,164 @@
    ```
 2. Wait 5 minutes for telemetry to land in Application Insights.
 3. Restart Copilot CLI so the MCP server connects fresh.
-4. Verify: `/mcp show azdoctor` — should show 18 tools.
+4. Verify: `/mcp show azdoctor` — should show 6 tools.
 
 ## The Demo
 
-### Scene 1: "Something is wrong with prod" (~30s)
+### Scene 1: "Something is wrong with prod" (~45s)
 
-You just got paged. First thing — check the health of the production environment.
+You just got paged. Start with a health scan to see the big picture.
 
 ```
 Check the health of the azdoctor-demo-prod resource group
 ```
 
-**What the audience sees:** Risk score, critical findings from Resource Health (stopped VM), Azure Advisor recommendations (missing health checks, HA gaps, cost waste), and activity log anomalies — all from one command.
+**What the audience sees:** Risk score, Resource Health status for all resources, Advisor cost findings (orphaned disk, empty plan), any failed deployments.
 
-**Talking point:** "One command gives me Resource Health, Azure Advisor, and Activity Log findings combined — no portal clicking."
+**Talking point:** "One command — Resource Health, Azure Advisor, and Activity Logs combined. I can see there's cost waste and a stopped VM, but what about the app?"
 
 ---
 
-### Scene 2: "Why is the app broken?" (~60s)
+### Scene 2: "Deep dive into the app" (~90s)
 
-Now zoom into the specific App Service that users are complaining about.
+This is the money shot. Investigate the App Service in depth.
 
 ```
 Investigate app-azdemo-prod-30bf1e4b in resource group azdoctor-demo-prod
 ```
 
-**What the audience sees:** Multi-signal investigation — current health status, dependency map (App Service → SQL Database), timeline of events, diagnostic pattern detection, metric trends, Log Analytics error counts, and recommended actions.
+**What the audience sees:**
+- **Metrics from the right places** — CPU and memory from the App Service Plan (where they actually live), HTTP errors and response times from the site itself. AZ Doctor figured this out dynamically — no hardcoded config.
+- **Real error details** — actual failing endpoints with HTTP status codes, average latency, exception messages from Log Analytics
+- **Dependency failures** — SQL call failures, external HTTP timeouts
+- **Actual dependencies** — found by parsing the app's connection strings, not just grabbing everything in the resource group
+- **Recent changes** — deployments, config changes, restarts from the activity log
 
-**Talking point:** "AZ Doctor correlated Resource Health, Activity Logs, Metrics, and dependent resources automatically. It found the SQL dependency, checked its health, detected the error pattern, and told me what to do — that's 5+ portal blades in one question."
+**Talking point:** "AZ Doctor dynamically discovered what metrics this resource emits, resolved that CPU and memory live on the App Service Plan, parsed the app's connection strings to find the SQL dependency, auto-discovered the Log Analytics workspace, and pulled failed requests, exceptions, and dependency failures — all in one call. Try doing that by hand."
+
+**Follow-up (shows depth):**
+```
+Now investigate the SQL database sqldb-azdemo-prod in the same resource group
+```
+
+**What the audience sees:** The same tool, same quality of output, but for a completely different resource type — SQL metrics (DTU, CPU, connections, deadlocks), no hardcoded logic. AZ Doctor dynamically discovered the SQL database's available metrics.
+
+**Talking point:** "Same tool, different resource type. AZ Doctor doesn't have hardcoded playbooks — it asks Azure what metrics are available and pulls them. This works for VMs, Redis, Cosmos, AKS, anything."
 
 ---
 
 ### Scene 3: "Is this CPU spike normal?" (~30s)
 
-The investigation showed elevated metrics. But is this actually abnormal, or does this app always run hot?
+The investigation showed elevated metrics. But is this abnormal?
 
 ```
 Is the CPU usage on app-azdemo-prod-30bf1e4b normal right now?
 ```
 
-**What the audience sees:** Current metrics compared against the 7-day baseline using z-scores. Each metric flagged as normal, elevated, or anomalous.
+**What the audience sees:** Current metrics compared against 7-day baseline using z-scores. Each metric flagged as normal, elevated, or anomalous. CPU and memory from the plan, HTTP metrics from the site.
 
-**Talking point:** "It compared current metrics against a 7-day rolling average. A z-score above 2 means this is statistically abnormal — not just a feeling."
-
----
-
-### Scene 4: "Show me the errors" (~30s)
-
-You know something is wrong. Now look at what's actually failing.
-
-```
-Show me failed requests for app-azdemo-prod-30bf1e4b in the last hour
-```
-
-**What the audience sees:** Natural language converted to KQL, workspace auto-discovered, query executed, results returned — failed requests by operation name with counts.
-
-**Talking point:** "I asked in English, it wrote the KQL, found the Log Analytics workspace, and ran the query. No need to remember KQL syntax or workspace IDs."
+**Talking point:** "Z-score comparison against a 7-day rolling average. This isn't a guess — it's statistically abnormal."
 
 ---
 
-### Scene 5: "Document what happened" (~30s)
+### Scene 4: "Generate the RCA" (~30s)
 
-You've diagnosed the issue. Now generate a formal Root Cause Analysis for the incident review.
+You've diagnosed the issue. Now generate a formal Root Cause Analysis scoped to the incident window.
 
 ```
-Generate an RCA for app-azdemo-prod-30bf1e4b
+Investigate app-azdemo-prod-30bf1e4b with start time 21:00 UTC today and end time 22:00 UTC today
 ```
 
-**What the audience sees:** Structured RCA document with correlated timeline, root cause narrative, impact assessment, and remediation steps. Ready for ServiceNow or a post-incident review.
+**What the audience sees:** Same rich investigation data, but scoped to the incident window. The model uses this to write a structured RCA.
 
-**Talking point:** "This is a structured RCA document I can paste into ServiceNow or share in a post-incident review — generated in seconds, not hours."
+**Follow-up:**
+```
+Write a formal RCA document based on that investigation
+```
+
+**What the audience sees:** The model writes a structured RCA — timeline, root cause, impact, remediation steps — from the raw diagnostic data. Ready for ServiceNow or a post-incident review.
+
+**Talking point:** "AZ Doctor gathered the data. The AI wrote the RCA. I didn't have to open a single portal blade."
 
 ---
 
-### Scene 6: "Is preprod affected too?" (~30s)
+### Scene 5: "Is preprod affected?" (~30s)
 
-Before you fix prod, check if preprod has the same problem — or if this is isolated.
+Before you fix prod, check if preprod has the same issue.
 
 ```
 Compare azdoctor-demo-prod vs azdoctor-demo-preprod
 ```
 
-**What the audience sees:** Resource inventory diff (prod has waste resources preprod doesn't), health divergence (prod degraded, preprod healthy), change velocity comparison.
+**What the audience sees:** Resource inventory diff, health divergence (prod degraded, preprod clean), resource count differences.
 
-**Talking point:** "Preprod is clean — this is a prod-only issue. I can also see prod has orphaned resources that preprod doesn't, which tells me someone's been provisioning without cleaning up."
-
----
-
-### Scene 7: "Fix it" (~30s)
-
-Time to remediate. Restart the App Service to clear the issue.
-
-```
-Restart app-azdemo-prod-30bf1e4b to mitigate the issue
-```
-
-**What the audience sees:** Dry-run by default — shows risk rating, what the action would do, rollback hints. Waits for confirmation before executing.
-
-**Talking point:** "Dry-run by default. It shows me the risk rating and what will happen before I say yes. Safe remediation, not YOLO."
+**Talking point:** "Preprod is clean — this is prod-only. I can also see infrastructure drift — prod has resources that don't exist in preprod."
 
 ---
 
-### Scene 8: "Make sure this doesn't happen again" (~30s)
+### Scene 6: "Fix it" (~30s)
 
-The fire is out. Now set up monitoring so you catch it earlier next time.
+Restart the app to clear the issue.
 
 ```
-Generate alert rules for app-azdemo-prod-30bf1e4b based on the investigation
+Restart app-azdemo-prod-30bf1e4b
 ```
 
-**What the audience sees:** Recommended alert rules with thresholds tailored from the investigation data, plus a deployable Bicep template.
+**What the audience sees:** Dry-run first — risk rating, expected downtime, rollback hints. Waits for confirmation.
 
-**Talking point:** "It generated alert rules based on what just happened — not generic defaults. And it gave me a Bicep template I can deploy directly."
+**Talking point:** "Dry-run by default. It shows me the risk before I commit. Safe remediation."
 
 ---
 
-### Scene 9: "How much are we wasting?" (~30s)
+### Scene 7: "Prevent recurrence" (~30s)
 
-While you're here, check what's costing money for no reason.
+Set up alerts so you catch this earlier next time.
 
 ```
-Find cost waste in azdoctor-demo-prod
+Generate alert rules for app-azdemo-prod-30bf1e4b based on what we found
 ```
 
-**What the audience sees:** Stopped VM still billing, empty App Service Plan, orphaned disk, orphaned public IP — each with estimated monthly cost and recommendation.
+**What the audience sees:** Alert rules with thresholds tailored from the investigation data, plus a deployable Bicep template. Metrics discovered dynamically, not hardcoded.
 
-**Talking point:** "Quick pivot — this isn't just for incidents. It found a stopped VM that's still billing, an empty App Service Plan, and orphaned resources. Easy wins."
+**Talking point:** "Alert rules based on what actually happened — not generic defaults. And a Bicep template I can deploy right now."
 
 ---
 
 ### Closing (~30s)
 
-Voiceover or text slide:
-
-> **AZ Doctor** — 18 diagnostic tools, powered by Azure Advisor + Resource Health + Activity Logs + Metrics + Log Analytics. Zero infrastructure cost. Reader RBAC. Plugs into Copilot CLI, VS Code, Claude Desktop, Cursor, or any MCP client.
+> **AZ Doctor** — 6 focused diagnostic tools that do the hard part: dynamically discover metrics for any Azure resource type, resolve dependencies from actual configuration, auto-discover Log Analytics workspaces, and compile everything into raw diagnostic data the AI can reason over.
 >
-> Think of it this way: Azure SRE Agent is the full-time SRE you hire. AZ Doctor is the doctor you visit when something hurts.
+> Zero infrastructure cost. Reader RBAC. Works with Copilot CLI, VS Code, Claude Desktop, Cursor, or any MCP client.
+>
+> Azure SRE Agent is the full-time SRE you hire. AZ Doctor is the doctor you visit when something hurts.
 
 ## Tips for Recording
 
-- **Don't wait for tool responses on camera.** Record each tool call, cut out the wait, stitch together the prompt → response. Copilot's thinking animation is not interesting to watch.
-- **Narrate over the output.** The JSON/table responses are dense — talk the audience through what matters.
-- **Keep your terminal font size large.** 16-18pt minimum so the text is readable in the video.
-- **Use a clean terminal.** Fresh Copilot CLI session, no clutter from previous commands.
+- **Don't wait for tool responses on camera.** Record each tool call, cut out the wait, stitch the prompt → response.
+- **Scene 2 is the star.** Spend the most time here. Show the metrics, the error details, the dependency resolution. Then show it works for SQL too.
+- **Narrate over the output.** The JSON/tables are dense — talk the audience through what matters.
+- **Keep your terminal font size large.** 16-18pt minimum.
+- **Use a clean terminal.** Fresh Copilot CLI session.
 
 ## Feature Coverage
 
-### Showcased in this demo (9 tools)
+### Showcased (6 tools)
 
-| Tool | Scene | Role in story |
-|------|-------|---------------|
-| `healthcheck` | 1 | First response — what's wrong? |
-| `investigate` | 2 | Deep diagnosis — why is it broken? |
+| Tool | Scene | Role |
+|------|-------|------|
+| `healthcheck` | 1 | Big picture — what's wrong? |
+| `investigate` | 2, 4 | Deep diagnosis + RCA data gathering |
 | `baseline` | 3 | Is this normal? |
-| `query` | 4 | Show me the logs |
-| `rca` | 5 | Document what happened |
-| `compare` | 6 | Is preprod affected? |
-| `remediate` | 7 | Fix it |
-| `alert_rules` | 8 | Prevent recurrence |
-| `cost` | 9 | Bonus — cost waste |
+| `compare` | 5 | Is preprod affected? |
+| `remediate` | 6 | Fix it safely |
+| `alert_rules` | 7 | Prevent recurrence |
 
-### Not in this demo (9 tools)
+### Key differentiator to highlight
 
-| Tool | Why it's excluded | How to mention it |
-|------|-------------------|-------------------|
-| `advisor` | Advisor findings are now embedded in healthcheck | Covered implicitly in Scene 1 |
-| `triage` | Does the same as scenes 1-3 + 8 combined | "There's a one-command version that does all of this at once" |
-| `sweep` | Needs multiple subscriptions to be interesting | "It can scan all your subscriptions at once" |
-| `check_permissions` | Setup step, not part of the story | Skip |
-| `playback` | Similar to RCA timeline | "There's also a timeline replay tool for post-incident reviews" |
-| `diagram` | Mermaid output doesn't render in terminal | "Generates Mermaid diagrams for PRs and docs" |
-| `journal` | Local file save, not visually interesting | "Saves investigations locally for future reference" |
-| `notify` | Needs a webhook URL, adds complexity | "Can send results to Teams or Slack" |
-| `playbooks` | Setup/management tool, not part of incident story | "Supports custom diagnostic runbooks" |
+AZ Doctor's value isn't in the number of tools — it's that `investigate` dynamically discovers what telemetry is available for ANY Azure resource type and compiles it all in one call. No hardcoded playbooks, no resource-specific configuration. The AI does the reasoning.
+
+## Teardown
+
+```bash
+bash demo/scripts/teardown.sh
+```
