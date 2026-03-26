@@ -88,10 +88,13 @@ app.get("/health", (req, res) => {
 });
 
 // Query SQL — generates dependency telemetry
+// The heavy query is intentional: on a Basic 5-DTU database, concurrent requests
+// will exhaust DTU capacity, causing timeouts and connection failures — exactly
+// the cascading failure scenario we want to demonstrate.
 app.get("/api/data", async (req, res) => {
   try {
     const result = await executeSql(
-      "SELECT TOP 100 o.name, o.type_desc FROM sys.objects o CROSS JOIN sys.columns c WHERE o.type = 'U' OR 1=1"
+      "SELECT TOP 500 o.name, o.type_desc, c.name as col_name FROM sys.objects o CROSS JOIN sys.columns c CROSS JOIN sys.types t ORDER BY o.name, c.name"
     );
     res.json({
       status: "ok",
@@ -100,6 +103,18 @@ app.get("/api/data", async (req, res) => {
     });
   } catch (err) {
     console.error("SQL error:", err.message);
+    if (appInsights.defaultClient) {
+      appInsights.defaultClient.trackException({ exception: err });
+      appInsights.defaultClient.trackDependency({
+        target: process.env.SQL_CONNECTION_STRING?.match(/Server=tcp:([^,]+)/)?.[1] ?? "sql",
+        name: "SQL query",
+        data: "SELECT FROM sys.objects",
+        duration: 0,
+        resultCode: "timeout",
+        success: false,
+        dependencyTypeName: "SQL",
+      });
+    }
     res.status(500).json({ error: "Database query failed", detail: err.message });
   }
 });
