@@ -1,5 +1,9 @@
 node_modules/
 server/*.tsbuildinfo
+server/build/tools/
+server/build/utils/
+server/build/*.map
+server/build/*.d.ts
 .env
 *.log
 demo/DEMO-WALKTHROUGH.md

@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "azdoctor": {
-      "command": "node",
-      "args": ["./server/build/index.js"]
-    }
-  }
-}
