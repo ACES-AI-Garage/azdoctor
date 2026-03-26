@@ -6,21 +6,31 @@ import {
   getResourceHealth,
   getActivityLogs,
   getMetrics,
+  listMetricDefinitions,
   batchExecute,
 } from "../utils/azure-client.js";
 import type { AzureError } from "../utils/azure-client.js";
-import {
-  correlateTimelines,
-  detectMetricAnomalies,
-} from "../utils/correlator.js";
-import type { DiagnosticEvent } from "../utils/correlator.js";
-import { getMetricConfig, getDependencyQueries } from "../utils/metric-config.js";
 import {
   renderTopology,
   renderMermaidTopology,
   renderMermaidTimeline,
 } from "../utils/formatters.js";
 import type { TopologyNode } from "../utils/formatters.js";
+
+// Resources where key metrics live on a parent resource, not the resource itself.
+const PARENT_METRIC_RESOURCES: Record<string, { property: string; label: string }> = {
+  "microsoft.web/sites": { property: "properties.serverFarmId", label: "App Service Plan" },
+};
+
+// Max metrics to pull per resource to keep diagrams readable
+const MAX_METRICS = 15;
+
+// Priority patterns for selecting the most useful metrics
+const METRIC_PRIORITY_PATTERNS = [
+  /percent/i, /cpu/i, /memory/i, /error/i, /5xx/i, /4xx/i, /fail/i,
+  /latency/i, /response.*time/i, /request/i, /connection/i, /dtu/i,
+  /throughput/i, /availability/i, /queue/i, /count/i,
+];
 
 export function registerDiagram(server: McpServer): void {
   server.tool(
@@ -55,17 +65,18 @@ export function registerDiagram(server: McpServer): void {
       const subscription = await resolveSubscription(subParam);
       const errors: AzureError[] = [];
 
-      // 1. Resolve resource ID from name if needed
+      // ── 1. Resolve resource ──────────────────────────────────────────
       let resourceId = resource;
       let resourceType = "Unknown";
       let resourceName = resource;
       let resolvedResourceGroup = resourceGroup;
+      let resourceProperties: Record<string, unknown> = {};
 
       if (!resource.startsWith("/subscriptions/")) {
         const rgFilter = resourceGroup
           ? `| where resourceGroup =~ '${resourceGroup}'`
           : "";
-        const resolveQuery = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup | take 1`;
+        const resolveQuery = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup, properties | take 1`;
         const resolved = await queryResourceGraph([subscription], resolveQuery);
         if (resolved.resources.length > 0) {
           const r = resolved.resources[0];
@@ -73,6 +84,7 @@ export function registerDiagram(server: McpServer): void {
           resourceType = (r.type as string) ?? "Unknown";
           resourceName = (r.name as string) ?? resource;
           resolvedResourceGroup = (r.resourceGroup as string) ?? resourceGroup;
+          resourceProperties = (r.properties as Record<string, unknown>) ?? {};
         } else if (resolved.error) {
           errors.push(resolved.error);
         }
@@ -89,7 +101,7 @@ export function registerDiagram(server: McpServer): void {
         }
       }
 
-      // 2. Build topology if requested
+      // ── 2. Build topology if requested ───────────────────────────────
       let topologyMermaid: string | undefined;
       let topologyAscii: string | undefined;
       let dependencyCount = 0;
@@ -111,36 +123,120 @@ export function registerDiagram(server: McpServer): void {
           isRoot: true,
         };
 
-        // Discover dependencies
+        // Discover actual dependencies (same pattern as investigate.ts)
         const depNodes: TopologyNode[] = [];
         if (resolvedResourceGroup) {
-          const depQueries = getDependencyQueries(resourceType, resolvedResourceGroup);
-          if (depQueries.length > 0) {
-            const depResults = await Promise.all(
-              depQueries.map((dq) => queryResourceGraph([subscription], dq.query))
-            );
+          const depResourceIds: Array<{ id: string; name: string; type: string }> = [];
 
-            // Collect and deduplicate
-            const allDeps = new Map<string, { id: string; name: string; type: string }>();
-            for (const result of depResults) {
-              for (const dep of result.resources) {
-                const depId = dep.id as string;
-                if (!allDeps.has(depId)) {
-                  allDeps.set(depId, {
-                    id: depId,
-                    name: dep.name as string,
-                    type: dep.type as string,
-                  });
+          if (resourceType.toLowerCase() === "microsoft.web/sites") {
+            // For App Services: parse app settings for connection references
+            const configQuery = `Resources
+| where type =~ 'microsoft.web/sites' and name =~ '${resourceName}' and resourceGroup =~ '${resolvedResourceGroup}'
+| project siteConfig = properties.siteConfig, serverFarmId = properties.serverFarmId
+| take 1`;
+            const configResult = await queryResourceGraph([subscription], configQuery);
+
+            const referencedNames = new Set<string>();
+            if (configResult.resources.length > 0) {
+              const config = configResult.resources[0];
+              const siteConfig = config["siteConfig"] as Record<string, unknown> | undefined;
+              const appSettings = siteConfig?.["appSettings"] as Array<{ name: string; value: string }> | undefined;
+
+              if (Array.isArray(appSettings)) {
+                for (const setting of appSettings) {
+                  const val = String(setting.value ?? "");
+                  // Extract server names from connection strings
+                  const serverMatch = val.match(/(?:Server|Data Source|AccountEndpoint)=(?:tcp:)?([^;,]+)/i);
+                  if (serverMatch) {
+                    const host = serverMatch[1].split(".")[0];
+                    referencedNames.add(host.toLowerCase());
+                  }
+                  // Redis
+                  const redisMatch = val.match(/([^.]+)\.redis\.cache\.windows\.net/i);
+                  if (redisMatch) referencedNames.add(redisMatch[1].toLowerCase());
+                  // Storage
+                  const storageMatch = val.match(/([^.]+)\.blob\.core\.windows\.net/i);
+                  if (storageMatch) referencedNames.add(storageMatch[1].toLowerCase());
+                  // Cosmos
+                  const cosmosMatch = val.match(/([^.]+)\.documents\.azure\.com/i);
+                  if (cosmosMatch) referencedNames.add(cosmosMatch[1].toLowerCase());
                 }
               }
-              if (result.error) {
-                errors.push(result.error);
+            }
+            if (configResult.error) errors.push(configResult.error);
+
+            if (referencedNames.size > 0) {
+              const nameFilter = Array.from(referencedNames).map((n) => `name =~ '${n}'`).join(" or ");
+              const refQuery = `Resources | where (${nameFilter}) | project id, name, type | take 20`;
+              const refResult = await queryResourceGraph([subscription], refQuery);
+              if (refResult.error) errors.push(refResult.error);
+              for (const dep of refResult.resources) {
+                depResourceIds.push({
+                  id: dep.id as string,
+                  name: dep.name as string,
+                  type: dep.type as string,
+                });
+              }
+
+              // Find child resources (e.g., SQL databases under referenced server)
+              for (const dep of [...depResourceIds]) {
+                if ((dep.type as string).toLowerCase() === "microsoft.sql/servers") {
+                  const dbQuery = `Resources | where type =~ 'microsoft.sql/servers/databases' and name != 'master' and resourceGroup =~ '${resolvedResourceGroup}' and id startswith '${dep.id}' | project id, name, type`;
+                  const dbResult = await queryResourceGraph([subscription], dbQuery);
+                  for (const db of dbResult.resources) {
+                    depResourceIds.push({
+                      id: db.id as string,
+                      name: db.name as string,
+                      type: db.type as string,
+                    });
+                  }
+                }
               }
             }
 
-            // Check health of each dependency
+            // Fallback: data resources in same RG
+            if (depResourceIds.length === 0) {
+              const fallbackQuery = `Resources
+| where resourceGroup =~ '${resolvedResourceGroup}'
+| where name != '${resourceName}'
+| where type in~ ('microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.servicebus/namespaces', 'microsoft.eventhub/namespaces')
+| where name != 'master'
+| project id, name, type
+| take 10`;
+              const fallbackResult = await queryResourceGraph([subscription], fallbackQuery);
+              if (fallbackResult.error) errors.push(fallbackResult.error);
+              for (const dep of fallbackResult.resources) {
+                depResourceIds.push({
+                  id: dep.id as string,
+                  name: dep.name as string,
+                  type: dep.type as string,
+                });
+              }
+            }
+          } else {
+            // For non-App Service resources: find data/compute resources in the same RG
+            const depQuery = `Resources
+| where resourceGroup =~ '${resolvedResourceGroup}'
+| where name != '${resourceName}'
+| where type in~ ('microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.web/sites', 'microsoft.compute/virtualmachines', 'microsoft.containerservice/managedclusters')
+| where name != 'master'
+| project id, name, type
+| take 10`;
+            const depResult = await queryResourceGraph([subscription], depQuery);
+            if (depResult.error) errors.push(depResult.error);
+            for (const dep of depResult.resources) {
+              depResourceIds.push({
+                id: dep.id as string,
+                name: dep.name as string,
+                type: dep.type as string,
+              });
+            }
+          }
+
+          // Check health of each dependency
+          if (depResourceIds.length > 0) {
             const healthChecks = await batchExecute(
-              Array.from(allDeps.values()).map((dep) => async () => {
+              depResourceIds.map((dep) => async () => {
                 const depHealth = await getResourceHealth(subscription, dep.id);
                 const depState =
                   (depHealth.statuses[0]?.properties?.availabilityState as TopologyNode["health"]) ??
@@ -166,20 +262,83 @@ export function registerDiagram(server: McpServer): void {
         topologyAscii = renderTopology(rootNode, depNodes);
       }
 
-      // 3. Build timeline if requested
+      // ── 3. Build timeline if requested ───────────────────────────────
       let timelineMermaid: string | undefined;
       let eventCount = 0;
 
       if (diagramType === "timeline" || diagramType === "both") {
-        const allEvents: DiagnosticEvent[] = [];
-        const metricConfig = getMetricConfig(resourceType);
+        interface TimelineEvent {
+          time: string;
+          event: string;
+          source: string;
+          severity: "critical" | "warning" | "info";
+        }
+        const allEvents: TimelineEvent[] = [];
 
-        const [healthResult, activityResult, metricsResult] = await Promise.all([
+        // Discover metrics dynamically via listMetricDefinitions
+        const metricDefs = await listMetricDefinitions(resourceId);
+        if (metricDefs.error) errors.push(metricDefs.error);
+
+        const sortedDefs = [...metricDefs.definitions].sort((a, b) => {
+          const aScore = METRIC_PRIORITY_PATTERNS.findIndex((p) => p.test(a.name));
+          const bScore = METRIC_PRIORITY_PATTERNS.findIndex((p) => p.test(b.name));
+          return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+        });
+        const selectedMetrics = sortedDefs.slice(0, MAX_METRICS).map((d) => d.name);
+
+        // Resolve parent resource for metrics (e.g., App Service Plan for CPU/Memory)
+        const parentConfig = PARENT_METRIC_RESOURCES[resourceType.toLowerCase()];
+        let parentResourceId: string | null = null;
+        let parentLabel: string | null = null;
+        let parentMetricNames: string[] = [];
+
+        if (parentConfig) {
+          const propPath = parentConfig.property.replace("properties.", "");
+          const parentId = resourceProperties[propPath] as string | undefined;
+          if (parentId) {
+            parentResourceId = parentId;
+            parentLabel = parentConfig.label;
+          } else {
+            const parentQuery = `Resources | where type =~ '${resourceType}' and name =~ '${resourceName}' | project parentId = ${parentConfig.property} | take 1`;
+            const parentResult = await queryResourceGraph([subscription], parentQuery);
+            if (parentResult.resources.length > 0) {
+              parentResourceId = (parentResult.resources[0]["parentId"] as string) ?? null;
+              parentLabel = parentConfig.label;
+            }
+          }
+
+          if (parentResourceId) {
+            const parentDefs = await listMetricDefinitions(parentResourceId);
+            if (parentDefs.error) errors.push(parentDefs.error);
+            const parentSorted = [...parentDefs.definitions].sort((a, b) => {
+              const aScore = METRIC_PRIORITY_PATTERNS.findIndex((p) => p.test(a.name));
+              const bScore = METRIC_PRIORITY_PATTERNS.findIndex((p) => p.test(b.name));
+              return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+            });
+            parentMetricNames = parentSorted.slice(0, MAX_METRICS).map((d) => d.name);
+          }
+        }
+
+        // Build metric fetch promises
+        const metricPromises: Array<{ label: string; promise: ReturnType<typeof getMetrics> }> = [];
+        if (selectedMetrics.length > 0) {
+          metricPromises.push({
+            label: resourceName,
+            promise: getMetrics(resourceId, selectedMetrics, timeframeHours, "PT5M"),
+          });
+        }
+        if (parentResourceId && parentMetricNames.length > 0) {
+          metricPromises.push({
+            label: parentLabel ?? "parent",
+            promise: getMetrics(parentResourceId, parentMetricNames, timeframeHours, "PT5M"),
+          });
+        }
+
+        // Gather health, activity log, and metrics in parallel
+        const [healthResult, activityResult, ...metricResults] = await Promise.all([
           getResourceHealth(subscription, resourceId),
           getActivityLogs(subscription, timeframeHours, resourceId),
-          metricConfig
-            ? getMetrics(resourceId, metricConfig.names, timeframeHours)
-            : Promise.resolve({ data: null, error: undefined }),
+          ...metricPromises.map((m) => m.promise),
         ]);
 
         // Process health
@@ -193,7 +352,6 @@ export function registerDiagram(server: McpServer): void {
               time: new Date().toISOString(),
               event: `Health status: ${currentHealth}`,
               source: "ResourceHealth",
-              resource: resourceName,
               severity: currentHealth === "Unavailable" ? "critical" : "warning",
             });
           }
@@ -215,18 +373,19 @@ export function registerDiagram(server: McpServer): void {
               time: timestamp,
               event: `${opName} (${status})`,
               source: "ActivityLog",
-              resource: resourceName,
-              actor: event.caller,
               severity: status === "Failed" ? "warning" : "info",
             });
           }
         }
 
-        // Process metrics
-        if (metricsResult.error) {
-          errors.push(metricsResult.error);
-        } else if (metricsResult.data && metricConfig) {
-          for (const metric of metricsResult.data.metrics) {
+        // Process metrics — detect anomalies inline using simple statistics
+        for (let i = 0; i < metricResults.length; i++) {
+          const result = metricResults[i];
+          const meta = metricPromises[i];
+          if (result.error) { errors.push(result.error); continue; }
+          if (!result.data) continue;
+
+          for (const metric of result.data.metrics) {
             for (const ts of metric.timeseries) {
               if (!ts.data) continue;
               const dataPoints = ts.data
@@ -235,29 +394,53 @@ export function registerDiagram(server: McpServer): void {
                   timestamp:
                     (dp as unknown as { timeStamp: Date }).timeStamp?.toISOString() ??
                     new Date().toISOString(),
-                  average: dp.average ?? undefined,
-                  maximum: dp.maximum ?? undefined,
+                  value: dp.average ?? dp.maximum ?? 0,
                 }));
-              const anomalies = detectMetricAnomalies(
-                resourceId,
-                metric.name,
-                dataPoints,
-                {
-                  warningPct: metricConfig.warningPct,
-                  criticalPct: metricConfig.criticalPct,
-                }
+
+              if (dataPoints.length < 3) continue;
+
+              // Simple anomaly detection: mean + 2 standard deviations
+              const values = dataPoints.map((p) => p.value);
+              const mean = values.reduce((a, b) => a + b, 0) / values.length;
+              const stdDev = Math.sqrt(
+                values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / values.length
               );
-              allEvents.push(...anomalies);
+              const warningThreshold = mean + 2 * stdDev;
+              const criticalThreshold = mean + 3 * stdDev;
+
+              // Also flag if metric is a percentage and exceeds 90/95
+              const isPercentage = /percent/i.test(metric.name) || metric.unit === "Percent";
+
+              for (const dp of dataPoints) {
+                let severity: "critical" | "warning" | null = null;
+
+                if (isPercentage) {
+                  if (dp.value >= 95) severity = "critical";
+                  else if (dp.value >= 90) severity = "warning";
+                } else if (stdDev > 0) {
+                  if (dp.value >= criticalThreshold) severity = "critical";
+                  else if (dp.value >= warningThreshold) severity = "warning";
+                }
+
+                if (severity) {
+                  allEvents.push({
+                    time: dp.timestamp,
+                    event: `${metric.name} spike: ${Math.round(dp.value * 100) / 100} (${meta?.label ?? "unknown"})`,
+                    source: "MetricAnomaly",
+                    severity,
+                  });
+                }
+              }
             }
           }
         }
 
-        // Correlate and build timeline
-        const correlation = correlateTimelines(allEvents);
-        eventCount = correlation.timeline.length;
+        // Sort events by time and build timeline
+        allEvents.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+        eventCount = allEvents.length;
 
         timelineMermaid = renderMermaidTimeline(
-          correlation.timeline.map((e) => ({
+          allEvents.map((e) => ({
             time: e.time,
             event: e.event,
             source: e.source,
@@ -266,7 +449,7 @@ export function registerDiagram(server: McpServer): void {
         );
       }
 
-      // 4. Build response
+      // ── 4. Build response ────────────────────────────────────────────
       const diagrams: Record<string, unknown> = {};
       if (topologyMermaid !== undefined) {
         diagrams.topology = {

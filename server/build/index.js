@@ -23746,800 +23746,11 @@ function registerCost(server2) {
   );
 }
 
-// src/utils/correlator.ts
-var ANOMALY_SOURCES = /* @__PURE__ */ new Set(["ResourceHealth", "Metrics", "ServiceHealth"]);
-var CHANGE_SOURCES = /* @__PURE__ */ new Set(["ActivityLog"]);
-var SEVERITY_RANK = {
-  critical: 3,
-  warning: 2,
-  info: 1
-};
-function clusterEvents(events, windowMinutes = 5) {
-  if (events.length === 0) return [];
-  const sorted = [...events].sort(
-    (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime()
-  );
-  const windowMs = windowMinutes * 60 * 1e3;
-  const clusters = [];
-  let currentCluster = [sorted[0]];
-  for (let i = 1; i < sorted.length; i++) {
-    const lastInCluster = currentCluster[currentCluster.length - 1];
-    const gap = new Date(sorted[i].time).getTime() - new Date(lastInCluster.time).getTime();
-    if (gap <= windowMs) {
-      currentCluster.push(sorted[i]);
-    } else {
-      clusters.push(buildCluster(currentCluster));
-      currentCluster = [sorted[i]];
-    }
-  }
-  clusters.push(buildCluster(currentCluster));
-  return clusters;
-}
-function buildCluster(events) {
-  const sources = [...new Set(events.map((e) => e.source))];
-  const highestSeverity = events.reduce(
-    (max, e) => {
-      const rank = SEVERITY_RANK[e.severity ?? "info"] ?? 1;
-      return rank > (SEVERITY_RANK[max] ?? 1) ? e.severity : max;
-    },
-    "info"
-  );
-  return {
-    startTime: events[0].time,
-    endTime: events[events.length - 1].time,
-    events,
-    sources,
-    severity: highestSeverity
-  };
-}
-function correlateTimelines(events, windowMinutes = 15) {
-  if (events.length === 0) {
-    return {
-      timeline: [],
-      earliestAnomaly: null,
-      precedingChanges: [],
-      likelyCause: "No diagnostic events were collected \u2014 insufficient data for correlation.",
-      confidence: "low",
-      cascadingFailure: false
-    };
-  }
-  const sorted = [...events].sort(
-    (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime()
-  );
-  const anomalies = sorted.filter((e) => ANOMALY_SOURCES.has(e.source));
-  const changes = sorted.filter((e) => CHANGE_SOURCES.has(e.source));
-  const anomalyClusters = clusterEvents(anomalies, 5);
-  const cascadingFailure = anomalyClusters.some(
-    (cluster) => cluster.events.length >= 3
-  );
-  const earliestAnomaly = anomalies.length > 0 ? anomalies[0] : null;
-  if (!earliestAnomaly) {
-    const confidence2 = changes.length > 0 ? "medium" : "low";
-    if (changes.length > 0) {
-      return {
-        timeline: sorted,
-        earliestAnomaly: null,
-        precedingChanges: changes,
-        likelyCause: `${changes.length} change(s) detected but no anomalies observed. Resources may be healthy, or monitoring data may be incomplete.`,
-        confidence: confidence2,
-        cascadingFailure: false
-      };
-    }
-    return {
-      timeline: sorted,
-      earliestAnomaly: null,
-      precedingChanges: [],
-      likelyCause: "No anomalies or changes detected in the investigation window.",
-      confidence: confidence2,
-      cascadingFailure: false
-    };
-  }
-  const anomalyTime = new Date(earliestAnomaly.time).getTime();
-  const windowMs = windowMinutes * 60 * 1e3;
-  const precedingChanges = changes.filter((c) => {
-    const changeTime = new Date(c.time).getTime();
-    return changeTime <= anomalyTime && anomalyTime - changeTime <= windowMs;
-  });
-  const hasAnomalies = anomalies.length > 0;
-  const hasPrecedingChanges = precedingChanges.length > 0;
-  let confidence;
-  if (hasPrecedingChanges && hasAnomalies) {
-    confidence = "high";
-  } else if (hasAnomalies || hasPrecedingChanges) {
-    confidence = "medium";
-  } else {
-    confidence = "low";
-  }
-  const likelyCause = buildCausalNarrative(
-    earliestAnomaly,
-    precedingChanges,
-    anomalies,
-    windowMinutes,
-    cascadingFailure
-  );
-  return {
-    timeline: sorted,
-    earliestAnomaly,
-    precedingChanges,
-    likelyCause,
-    confidence,
-    cascadingFailure
-  };
-}
-function buildCausalNarrative(earliestAnomaly, precedingChanges, allAnomalies, windowMinutes, cascadingFailure) {
-  const parts = [];
-  if (precedingChanges.length > 0) {
-    const change = precedingChanges[precedingChanges.length - 1];
-    const changeTime = new Date(change.time);
-    const anomalyTime = new Date(earliestAnomaly.time);
-    const gapMinutes = Math.round(
-      (anomalyTime.getTime() - changeTime.getTime()) / 6e4
-    );
-    parts.push(
-      `A change at ${change.time} ("${change.event}"${change.actor ? ` by ${change.actor}` : ""}) preceded the first anomaly by ${gapMinutes} minute(s).`
-    );
-    parts.push(
-      `First anomaly at ${earliestAnomaly.time}: "${earliestAnomaly.event}" (source: ${earliestAnomaly.source}).`
-    );
-    if (allAnomalies.length > 1) {
-      parts.push(
-        `${allAnomalies.length - 1} additional anomaly event(s) followed within the investigation window.`
-      );
-    }
-    parts.push(
-      `Correlation: the change likely triggered the observed anomalies (${gapMinutes}min gap, within ${windowMinutes}min correlation window).`
-    );
-  } else {
-    parts.push(
-      `First anomaly at ${earliestAnomaly.time}: "${earliestAnomaly.event}" (source: ${earliestAnomaly.source}).`
-    );
-    parts.push(
-      `No preceding changes found within the ${windowMinutes}-minute correlation window.`
-    );
-    parts.push(
-      "This may indicate a platform-level issue, gradual resource exhaustion, or changes made outside the monitored scope."
-    );
-  }
-  if (cascadingFailure) {
-    parts.push(
-      "Cascading failure pattern detected: 3+ anomalies clustered within 5 minutes, suggesting a chain reaction across resources."
-    );
-  }
-  return parts.join(" ");
-}
-function detectMetricAnomalies(resourceId, metricName, dataPoints, thresholds) {
-  const events = [];
-  for (const dp of dataPoints) {
-    const value = dp.maximum ?? dp.average;
-    if (value === void 0) continue;
-    if (value >= thresholds.criticalPct) {
-      events.push({
-        time: dp.timestamp,
-        event: `${metricName} at ${value.toFixed(1)}% (critical threshold: ${thresholds.criticalPct}%)`,
-        source: "Metrics",
-        resource: resourceId,
-        severity: "critical"
-      });
-    } else if (value >= thresholds.warningPct) {
-      events.push({
-        time: dp.timestamp,
-        event: `${metricName} at ${value.toFixed(1)}% (warning threshold: ${thresholds.warningPct}%)`,
-        source: "Metrics",
-        resource: resourceId,
-        severity: "warning"
-      });
-    }
-  }
-  return events;
-}
-function detectDiagnosticPatterns(events, resourceType) {
-  const insights = [];
-  const normalizedType = resourceType.toLowerCase();
-  const findEvents = (substring) => events.filter((e) => e.event.toLowerCase().includes(substring.toLowerCase()));
-  const findEventsBySeverity = (substring, ...severities) => events.filter(
-    (e) => e.event.toLowerCase().includes(substring.toLowerCase()) && severities.includes(e.severity ?? "info")
-  );
-  const findEventsBySource = (source) => events.filter((e) => e.source === source);
-  const withinMinutes = (a, b, minutes) => {
-    const diff = Math.abs(
-      new Date(a.time).getTime() - new Date(b.time).getTime()
-    );
-    return diff <= minutes * 60 * 1e3;
-  };
-  const anyWithinMinutes = (groupA, groupB, minutes) => {
-    for (const a of groupA) {
-      for (const b of groupB) {
-        if (withinMinutes(a, b, minutes)) return true;
-      }
-    }
-    return false;
-  };
-  if (normalizedType === "microsoft.web/sites") {
-    const deployments = findEventsBySource("ActivityLog").filter(
-      (e) => e.event.toLowerCase().includes("deploy") || e.event.toLowerCase().includes("restart") || e.event.toLowerCase().includes("swap") || e.event.toLowerCase().includes("write")
-    );
-    const http5xx = findEvents("Http5xx");
-    const httpResponseTime = findEvents("HttpResponseTime");
-    const errorSignals = [...http5xx, ...httpResponseTime];
-    if (deployments.length > 0 && errorSignals.length > 0 && anyWithinMinutes(deployments, errorSignals, 15)) {
-      insights.push({
-        pattern: "bad_deployment",
-        description: "A deployment or configuration change occurred shortly before HTTP errors or response time degradation.",
-        confidence: "high",
-        evidence: [
-          ...deployments.map((e) => `[ActivityLog] ${e.event} at ${e.time}`),
-          ...errorSignals.map((e) => `[Metrics] ${e.event} at ${e.time}`)
-        ],
-        recommendation: "Recent deployment likely caused errors. Consider rolling back."
-      });
-    }
-    const memoryCritical = findEventsBySeverity(
-      "MemoryPercentage",
-      "critical"
-    );
-    const httpQueue = findEvents("HttpQueueLength");
-    const httpRespWarnCrit = findEventsBySeverity(
-      "HttpResponseTime",
-      "warning",
-      "critical"
-    );
-    const queueOrResp = [...httpQueue, ...httpRespWarnCrit];
-    if (memoryCritical.length > 0 && queueOrResp.length > 0) {
-      insights.push({
-        pattern: "memory_exhaustion",
-        description: "High memory usage is causing request queuing and response time degradation.",
-        confidence: "high",
-        evidence: [
-          ...memoryCritical.map((e) => `[Metrics] ${e.event} at ${e.time}`),
-          ...queueOrResp.map((e) => `[Metrics] ${e.event} at ${e.time}`)
-        ],
-        recommendation: "Memory pressure causing request queuing. Scale up the App Service Plan or optimize memory usage."
-      });
-    }
-    const cpuCritical = findEventsBySeverity("CpuPercentage", "critical");
-    if (cpuCritical.length > 0 && httpRespWarnCrit.length > 0) {
-      insights.push({
-        pattern: "cpu_saturation",
-        description: "High CPU usage is degrading HTTP response times.",
-        confidence: "high",
-        evidence: [
-          ...cpuCritical.map((e) => `[Metrics] ${e.event} at ${e.time}`),
-          ...httpRespWarnCrit.map((e) => `[Metrics] ${e.event} at ${e.time}`)
-        ],
-        recommendation: "CPU saturation degrading response times. Scale out or optimize CPU-intensive operations."
-      });
-    }
-    const healthCheck = findEvents("HealthCheckStatus");
-    if (healthCheck.length > 0) {
-      insights.push({
-        pattern: "health_check_failure",
-        description: "The health check endpoint is reporting failures.",
-        confidence: "medium",
-        evidence: healthCheck.map(
-          (e) => `[Metrics] ${e.event} at ${e.time}`
-        ),
-        recommendation: "Health check endpoint is failing. Review the health check path configuration and application startup."
-      });
-    }
-  }
-  if (normalizedType === "microsoft.sql/servers/databases") {
-    const dtuCritical = findEventsBySeverity(
-      "dtu_consumption_percent",
-      "critical"
-    );
-    if (dtuCritical.length > 0) {
-      insights.push({
-        pattern: "dtu_exhaustion",
-        description: "Database DTU consumption has reached critical levels.",
-        confidence: "high",
-        evidence: dtuCritical.map(
-          (e) => `[Metrics] ${e.event} at ${e.time}`
-        ),
-        recommendation: "DTU capacity exhausted. Scale up the database tier or optimize queries."
-      });
-    }
-    const connFailed = findEventsBySeverity(
-      "connection_failed",
-      "warning",
-      "critical"
-    );
-    if (connFailed.length > 0) {
-      insights.push({
-        pattern: "connection_storm",
-        description: "Database connection failures are occurring.",
-        confidence: "high",
-        evidence: connFailed.map(
-          (e) => `[Metrics] ${e.event} at ${e.time}`
-        ),
-        recommendation: "Connection failures detected. Check connection pool settings and max connection limits."
-      });
-    }
-    const deadlocks = findEventsBySeverity("deadlock", "warning", "critical");
-    const dtuWarning = findEventsBySeverity(
-      "dtu_consumption_percent",
-      "warning"
-    );
-    if (deadlocks.length > 0 && dtuWarning.length > 0) {
-      insights.push({
-        pattern: "deadlock_storm",
-        description: "Deadlocks are occurring alongside elevated DTU consumption.",
-        confidence: "high",
-        evidence: [
-          ...deadlocks.map((e) => `[Metrics] ${e.event} at ${e.time}`),
-          ...dtuWarning.map((e) => `[Metrics] ${e.event} at ${e.time}`)
-        ],
-        recommendation: "Deadlocks under load. Review transaction isolation levels and query patterns."
-      });
-    }
-  }
-  if (normalizedType === "microsoft.compute/virtualmachines") {
-    const diskQueue = findEventsBySeverity(
-      "OS Disk Queue Depth",
-      "critical"
-    );
-    if (diskQueue.length > 0) {
-      insights.push({
-        pattern: "disk_bottleneck",
-        description: "OS disk I/O queue depth has reached critical levels.",
-        confidence: "high",
-        evidence: diskQueue.map(
-          (e) => `[Metrics] ${e.event} at ${e.time}`
-        ),
-        recommendation: "Disk I/O bottleneck. Consider Premium SSD or Ultra Disk, or distribute I/O across multiple disks."
-      });
-    }
-    const networkIn = findEventsBySeverity("Network In", "critical");
-    const networkOut = findEventsBySeverity("Network Out", "critical");
-    const networkEvents = [...networkIn, ...networkOut];
-    if (networkEvents.length > 0) {
-      insights.push({
-        pattern: "network_saturation",
-        description: "Network bandwidth has reached critical levels.",
-        confidence: "high",
-        evidence: networkEvents.map(
-          (e) => `[Metrics] ${e.event} at ${e.time}`
-        ),
-        recommendation: "Network bandwidth saturated. Consider accelerated networking or scaling to a larger VM size."
-      });
-    }
-  }
-  const healthUnavailable = events.filter(
-    (e) => e.source === "ResourceHealth" && e.event.toLowerCase().includes("unavailable")
-  );
-  const activityLogEvents = findEventsBySource("ActivityLog");
-  if (healthUnavailable.length > 0) {
-    const hasPrecedingChange = healthUnavailable.some((h) => {
-      const hTime = new Date(h.time).getTime();
-      return activityLogEvents.some((a) => {
-        const aTime = new Date(a.time).getTime();
-        return aTime < hTime && hTime - aTime <= 15 * 60 * 1e3;
-      });
-    });
-    if (!hasPrecedingChange) {
-      insights.push({
-        pattern: "platform_incident",
-        description: "Resource became unavailable with no preceding configuration changes.",
-        confidence: "medium",
-        evidence: healthUnavailable.map(
-          (e) => `[ResourceHealth] ${e.event} at ${e.time}`
-        ),
-        recommendation: "Platform-level incident suspected. Check Azure Service Health."
-      });
-    }
-  }
-  if (activityLogEvents.length >= 5) {
-    const sorted = [...activityLogEvents].sort(
-      (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime()
-    );
-    const tenMinMs = 10 * 60 * 1e3;
-    let found = false;
-    for (let i = 0; i <= sorted.length - 5 && !found; i++) {
-      const startTime = new Date(sorted[i].time).getTime();
-      const endTime = new Date(sorted[i + 4].time).getTime();
-      if (endTime - startTime <= tenMinMs) {
-        found = true;
-        insights.push({
-          pattern: "rapid_config_changes",
-          description: "Multiple configuration changes occurred in a short time window.",
-          confidence: "medium",
-          evidence: sorted.map(
-            (e) => `[ActivityLog] ${e.event} at ${e.time}`
-          ),
-          recommendation: "Rapid configuration changes detected. This may indicate automated remediation loops or deployment issues."
-        });
-      }
-    }
-  }
-  const confidenceOrder = {
-    high: 0,
-    medium: 1,
-    low: 2
-  };
-  insights.sort(
-    (a, b) => (confidenceOrder[a.confidence] ?? 2) - (confidenceOrder[b.confidence] ?? 2)
-  );
-  return insights;
-}
-function detectTrends(dataPoints, metricName) {
-  const values = [];
-  for (const dp of dataPoints) {
-    const v = dp.average ?? dp.maximum;
-    if (v !== void 0) {
-      values.push(v);
-    }
-  }
-  const n = values.length;
-  if (n < 2) {
-    return {
-      metricName,
-      trend: "stable",
-      slope: 0,
-      dataPoints: n,
-      description: `${metricName} has insufficient data points for trend analysis.`
-    };
-  }
-  let sumX = 0;
-  let sumY = 0;
-  let sumXY = 0;
-  let sumX2 = 0;
-  for (let i = 0; i < n; i++) {
-    sumX += i;
-    sumY += values[i];
-    sumXY += i * values[i];
-    sumX2 += i * i;
-  }
-  const denominator = n * sumX2 - sumX * sumX;
-  const rawSlope = denominator !== 0 ? (n * sumXY - sumX * sumY) / denominator : 0;
-  const intercept = (sumY - rawSlope * sumX) / n;
-  const minVal = Math.min(...values);
-  const maxVal = Math.max(...values);
-  const dataRange = maxVal - minVal;
-  let normalizedSlope;
-  if (dataRange === 0) {
-    normalizedSlope = 0;
-  } else {
-    const totalChange = rawSlope * (n - 1);
-    normalizedSlope = Math.max(-1, Math.min(1, totalChange / dataRange));
-  }
-  const meanY = sumY / n;
-  let ssRes = 0;
-  let ssTot = 0;
-  for (let i = 0; i < n; i++) {
-    const predicted = intercept + rawSlope * i;
-    ssRes += (values[i] - predicted) ** 2;
-    ssTot += (values[i] - meanY) ** 2;
-  }
-  const rSquared = ssTot !== 0 ? 1 - ssRes / ssTot : 1;
-  let trend;
-  if (Math.abs(normalizedSlope) < 0.1) {
-    trend = "stable";
-  } else if (rSquared < 0.3) {
-    trend = "volatile";
-  } else if (normalizedSlope > 0) {
-    trend = "rising";
-  } else {
-    trend = "falling";
-  }
-  let description;
-  switch (trend) {
-    case "rising":
-      description = `${metricName} is rising steadily over the observed period.`;
-      break;
-    case "falling":
-      description = `${metricName} is falling steadily over the observed period.`;
-      break;
-    case "stable":
-      description = `${metricName} is stable over the observed period.`;
-      break;
-    case "volatile":
-      description = `${metricName} is volatile with no clear trend over the observed period.`;
-      break;
-  }
-  return {
-    metricName,
-    trend,
-    slope: Math.round(normalizedSlope * 1e3) / 1e3,
-    // round to 3 decimal places
-    dataPoints: n,
-    description
-  };
-}
-
-// src/utils/metric-config.ts
-var TYPE_SHORTCUTS = {
-  VM: "microsoft.compute/virtualmachines",
-  SQL: "microsoft.sql/servers/databases",
-  APPSERVICE: "microsoft.web/sites",
-  APPPLAN: "microsoft.web/serverfarms",
-  REDIS: "microsoft.cache/redis",
-  COSMOS: "microsoft.documentdb/databaseaccounts",
-  AKS: "microsoft.containerservice/managedclusters",
-  STORAGE: "microsoft.storage/storageaccounts",
-  KEYVAULT: "microsoft.keyvault/vaults",
-  APIM: "microsoft.apimanagement/service",
-  SERVICEBUS: "microsoft.servicebus/namespaces",
-  EVENTHUB: "microsoft.eventhub/namespaces",
-  POSTGRES: "microsoft.dbforpostgresql/flexibleservers",
-  MYSQL: "microsoft.dbformysql/flexibleservers",
-  APPGW: "microsoft.network/applicationgateways",
-  LB: "microsoft.network/loadbalancers",
-  FIREWALL: "microsoft.network/azurefirewalls",
-  CDN: "microsoft.cdn/profiles",
-  COGNITIVE: "microsoft.cognitiveservices/accounts",
-  SIGNALR: "microsoft.signalrservice/signalr"
-};
-function loadThresholdOverrides() {
-  const overrides = { perType: {} };
-  const globalWarn = process.env.AZDOCTOR_THRESHOLD_WARNING;
-  if (globalWarn) overrides.globalWarning = parseInt(globalWarn, 10);
-  const globalCrit = process.env.AZDOCTOR_THRESHOLD_CRITICAL;
-  if (globalCrit) overrides.globalCritical = parseInt(globalCrit, 10);
-  for (const [shortcut, fullType] of Object.entries(TYPE_SHORTCUTS)) {
-    const warn = process.env[`AZDOCTOR_THRESHOLD_${shortcut}_WARNING`];
-    const crit = process.env[`AZDOCTOR_THRESHOLD_${shortcut}_CRITICAL`];
-    if (warn || crit) {
-      overrides.perType[fullType] = {
-        warning: warn ? parseInt(warn, 10) : void 0,
-        critical: crit ? parseInt(crit, 10) : void 0
-      };
-    }
-  }
-  return overrides;
-}
-var thresholdOverrides = loadThresholdOverrides();
-var METRIC_MAP = {
-  // Compute
-  "microsoft.web/sites": {
-    names: ["Http5xx", "Http4xx", "HttpResponseTime", "CpuPercentage", "MemoryPercentage", "HealthCheckStatus"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.web/serverfarms": {
-    names: ["CpuPercentage", "MemoryPercentage", "DiskQueueLength", "HttpQueueLength"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.compute/virtualmachines": {
-    names: ["Percentage CPU", "Available Memory Bytes", "OS Disk Queue Depth", "Network In Total", "Network Out Total"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.containerservice/managedclusters": {
-    names: ["node_cpu_usage_percentage", "node_memory_rss_percentage", "kube_pod_status_ready"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Databases
-  "microsoft.sql/servers/databases": {
-    names: ["dtu_consumption_percent", "connection_failed", "deadlock", "storage_percent", "workers_percent"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.documentdb/databaseaccounts": {
-    names: ["TotalRequestUnits", "NormalizedRUConsumption", "TotalRequests", "Http429"],
-    warningPct: 80,
-    criticalPct: 95
-  },
-  "microsoft.dbformysql/flexibleservers": {
-    names: ["cpu_percent", "memory_percent", "io_consumption_percent", "active_connections", "storage_percent"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.dbforpostgresql/flexibleservers": {
-    names: ["cpu_percent", "memory_percent", "storage_percent", "active_connections"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Caching
-  "microsoft.cache/redis": {
-    names: ["percentProcessorTime", "usedmemorypercentage", "serverLoad", "cacheRead", "cacheWrite", "connectedclients"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Storage
-  "microsoft.storage/storageaccounts": {
-    names: ["Availability", "SuccessE2ELatency", "SuccessServerLatency", "Transactions"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Networking
-  "microsoft.network/applicationgateways": {
-    names: ["TotalRequests", "FailedRequests", "ResponseStatus", "HealthyHostCount", "UnhealthyHostCount", "BackendResponseStatus"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.network/loadbalancers": {
-    names: ["SnatConnectionCount", "AllocatedSnatPorts", "UsedSnatPorts", "DipAvailability", "VipAvailability"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.network/azurefirewalls": {
-    names: ["Throughput", "ApplicationRuleHit", "NetworkRuleHit", "FirewallHealth"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.cdn/profiles": {
-    names: ["RequestCount", "ByteHitRatio", "OriginHealthPercentage", "TotalLatency"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Messaging
-  "microsoft.servicebus/namespaces": {
-    names: ["IncomingRequests", "ServerErrors", "ThrottledRequests", "ActiveMessages", "DeadletteredMessages"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.eventhub/namespaces": {
-    names: ["IncomingRequests", "ServerErrors", "ThrottledRequests", "OutgoingMessages", "IncomingBytes"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // AI & API
-  "microsoft.cognitiveservices/accounts": {
-    names: ["TotalCalls", "TotalErrors", "Latency", "SuccessRate"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  "microsoft.apimanagement/service": {
-    names: ["TotalRequests", "FailedRequests", "UnauthorizedRequests", "BackendDuration", "Capacity"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // Security
-  "microsoft.keyvault/vaults": {
-    names: ["ServiceApiHit", "ServiceApiLatency", "Availability", "SaturationShoebox"],
-    warningPct: 80,
-    criticalPct: 90
-  },
-  // SignalR
-  "microsoft.signalrservice/signalr": {
-    names: ["ConnectionCount", "MessageCount", "ServerLoad", "ConnectionCloseCount"],
-    warningPct: 80,
-    criticalPct: 90
-  }
-};
-var DEPENDENCY_MAP = {
-  "microsoft.web/sites": [
-    {
-      description: "Databases (SQL, MySQL, PostgreSQL, Cosmos DB)",
-      query: "Resources | where resourceGroup =~ '{rg}' and (type =~ 'Microsoft.Sql/servers/databases' or type =~ 'Microsoft.DocumentDB/databaseAccounts' or type =~ 'Microsoft.DBforMySQL/flexibleServers' or type =~ 'Microsoft.DBforPostgreSQL/flexibleServers') | project id, name, type"
-    },
-    {
-      description: "Caches (Redis)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Cache/Redis' | project id, name, type"
-    },
-    {
-      description: "Storage accounts",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Storage/storageAccounts' | project id, name, type"
-    },
-    {
-      description: "Key Vaults",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.KeyVault/vaults' | project id, name, type"
-    },
-    {
-      description: "Service Bus / Event Hub",
-      query: "Resources | where resourceGroup =~ '{rg}' and (type =~ 'Microsoft.ServiceBus/namespaces' or type =~ 'Microsoft.EventHub/namespaces') | project id, name, type"
-    }
-  ],
-  "microsoft.compute/virtualmachines": [
-    {
-      description: "Disks",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/disks' | project id, name, type"
-    },
-    {
-      description: "Network interfaces",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Network/networkInterfaces' | project id, name, type"
-    },
-    {
-      description: "Network security groups",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Network/networkSecurityGroups' | project id, name, type"
-    }
-  ],
-  "microsoft.containerservice/managedclusters": [
-    {
-      description: "Container registries",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.ContainerRegistry/registries' | project id, name, type"
-    },
-    {
-      description: "Key Vaults",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.KeyVault/vaults' | project id, name, type"
-    },
-    {
-      description: "Storage accounts",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Storage/storageAccounts' | project id, name, type"
-    }
-  ],
-  "microsoft.network/applicationgateways": [
-    {
-      description: "Backend App Services",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    },
-    {
-      description: "Backend VMs",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/virtualMachines' | project id, name, type"
-    }
-  ],
-  "microsoft.apimanagement/service": [
-    {
-      description: "Backend App Services",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    },
-    {
-      description: "Backend Functions",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' and kind contains 'functionapp' | project id, name, type"
-    }
-  ],
-  "microsoft.sql/servers/databases": [
-    {
-      description: "Dependent App Services",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    }
-  ],
-  "microsoft.web/serverfarms": [
-    {
-      description: "App Services on this plan",
-      query: "Resources | where type =~ 'Microsoft.Web/sites' and resourceGroup =~ '{rg}' | project id, name, type"
-    }
-  ],
-  "microsoft.cache/redis": [
-    {
-      description: "App Services (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    }
-  ],
-  "microsoft.keyvault/vaults": [
-    {
-      description: "App Services (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    },
-    {
-      description: "VMs (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/virtualMachines' | project id, name, type"
-    }
-  ],
-  "microsoft.network/loadbalancers": [
-    {
-      description: "Backend VMs",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Compute/virtualMachines' | project id, name, type"
-    }
-  ],
-  "microsoft.servicebus/namespaces": [
-    {
-      description: "App Services (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    },
-    {
-      description: "Functions (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' and kind contains 'functionapp' | project id, name, type"
-    }
-  ],
-  "microsoft.eventhub/namespaces": [
-    {
-      description: "App Services (potential consumers)",
-      query: "Resources | where resourceGroup =~ '{rg}' and type =~ 'Microsoft.Web/sites' | project id, name, type"
-    }
-  ]
-};
-function getMetricConfig(resourceType) {
-  const base = METRIC_MAP[resourceType.toLowerCase()];
-  if (!base) return void 0;
-  const typeOverride = thresholdOverrides.perType[resourceType.toLowerCase()];
-  return {
-    names: base.names,
-    warningPct: typeOverride?.warning ?? thresholdOverrides.globalWarning ?? base.warningPct,
-    criticalPct: typeOverride?.critical ?? thresholdOverrides.globalCritical ?? base.criticalPct
-  };
-}
-function getDependencyQueries(resourceType, resourceGroup) {
-  const queries = DEPENDENCY_MAP[resourceType.toLowerCase()];
-  if (!queries) return [];
-  return queries.map((q) => ({
-    ...q,
-    query: q.query.replace(/\{rg\}/g, resourceGroup)
-  }));
-}
-
 // src/tools/playback.ts
+var PARENT_METRIC_RESOURCES3 = {
+  "microsoft.web/sites": { property: "properties.serverFarmId", label: "App Service Plan" }
+};
+var MAX_METRICS3 = 15;
 function registerPlayback(server2) {
   server2.tool(
     "azdoctor_playback",
@@ -24548,44 +23759,95 @@ function registerPlayback(server2) {
       resource: external_exports.string().describe("Resource name or full Azure resource ID"),
       subscription: external_exports.string().optional(),
       startTime: external_exports.string().describe("ISO timestamp for playback start"),
-      endTime: external_exports.string().optional().describe("ISO timestamp for playback end (defaults to now)"),
-      includeContext: external_exports.boolean().default(true).describe("Include explanatory context for each event")
+      endTime: external_exports.string().optional().describe("ISO timestamp for playback end (defaults to now)")
     },
-    async ({ resource, subscription: subParam, startTime, endTime, includeContext }) => {
+    async ({ resource, subscription: subParam, startTime, endTime }) => {
       const subscription = await resolveSubscription(subParam);
       const errors = [];
-      const allEvents = [];
       let resourceId = resource;
-      let resourceType = "Unknown";
+      let resourceType = "unknown";
       let resourceName = resource;
+      let resourceProperties = {};
       if (!resource.startsWith("/subscriptions/")) {
-        const resolveQuery = `Resources | where name =~ '${resource}' | project id, name, type, location, resourceGroup | take 1`;
-        const resolved = await queryResourceGraph([subscription], resolveQuery);
-        if (resolved.resources.length > 0) {
-          const r = resolved.resources[0];
-          resourceId = r.id ?? resource;
-          resourceType = r.type ?? "Unknown";
+        const q = `Resources | where name =~ '${resource}' | project id, name, type, location, resourceGroup, properties | take 1`;
+        const result = await queryResourceGraph([subscription], q);
+        if (result.resources.length > 0) {
+          const r = result.resources[0];
+          resourceId = r.id;
+          resourceType = r.type ?? "unknown";
           resourceName = r.name ?? resource;
-        } else if (resolved.error) {
-          errors.push(resolved.error);
+          resourceProperties = r.properties ?? {};
+        } else if (result.error) {
+          errors.push(result.error);
         }
       } else {
         const parts = resource.split("/");
         resourceName = parts[parts.length - 1] ?? resource;
-        const providerIdx = parts.indexOf("providers");
-        if (providerIdx !== -1 && parts.length > providerIdx + 2) {
-          resourceType = `${parts[providerIdx + 1]}/${parts[providerIdx + 2]}`;
-        }
+        const pi = parts.indexOf("providers");
+        if (pi !== -1 && parts.length > pi + 2) resourceType = `${parts[pi + 1]}/${parts[pi + 2]}`;
       }
       const startDate = new Date(startTime);
       const endDate = endTime ? new Date(endTime) : /* @__PURE__ */ new Date();
       const hoursBack = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (60 * 60 * 1e3)));
-      const metricConfig = getMetricConfig(resourceType);
-      const [healthResult, activityResult, metricsResult] = await Promise.all([
+      const metricDefs = await listMetricDefinitions(resourceId);
+      if (metricDefs.error) errors.push(metricDefs.error);
+      const priorityPatterns = [/percent/i, /cpu/i, /memory/i, /error/i, /5xx/i, /4xx/i, /fail/i, /latency/i, /response.*time/i, /request/i, /connection/i, /dtu/i, /throughput/i, /availability/i, /queue/i, /count/i];
+      const sortedDefs = [...metricDefs.definitions].sort((a, b) => {
+        const aScore = priorityPatterns.findIndex((p) => p.test(a.name));
+        const bScore = priorityPatterns.findIndex((p) => p.test(b.name));
+        return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+      });
+      const selectedMetrics = sortedDefs.slice(0, MAX_METRICS3).map((d) => d.name);
+      const parentConfig = PARENT_METRIC_RESOURCES3[resourceType.toLowerCase()];
+      let parentResourceId = null;
+      let parentLabel = null;
+      if (parentConfig) {
+        const propPath = parentConfig.property.replace("properties.", "");
+        const parentId = resourceProperties[propPath];
+        if (parentId) {
+          parentResourceId = parentId;
+          parentLabel = parentConfig.label;
+        } else {
+          const parentQuery = `Resources | where type =~ '${resourceType}' and name =~ '${resourceName}' | project parentId = ${parentConfig.property} | take 1`;
+          const parentResult = await queryResourceGraph([subscription], parentQuery);
+          if (parentResult.resources.length > 0) {
+            parentResourceId = parentResult.resources[0]["parentId"] ?? null;
+            parentLabel = parentConfig.label;
+          }
+        }
+      }
+      let parentMetricNames = [];
+      if (parentResourceId) {
+        const parentDefs = await listMetricDefinitions(parentResourceId);
+        if (parentDefs.error) errors.push(parentDefs.error);
+        const parentSorted = [...parentDefs.definitions].sort((a, b) => {
+          const aScore = priorityPatterns.findIndex((p) => p.test(a.name));
+          const bScore = priorityPatterns.findIndex((p) => p.test(b.name));
+          return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+        });
+        parentMetricNames = parentSorted.slice(0, MAX_METRICS3).map((d) => d.name);
+      }
+      const metricPromises = [];
+      if (selectedMetrics.length > 0) {
+        metricPromises.push({
+          label: resourceName,
+          resourceId,
+          promise: getMetrics(resourceId, selectedMetrics, hoursBack, "PT5M")
+        });
+      }
+      if (parentResourceId && parentMetricNames.length > 0) {
+        metricPromises.push({
+          label: parentLabel ?? "parent",
+          resourceId: parentResourceId,
+          promise: getMetrics(parentResourceId, parentMetricNames, hoursBack, "PT5M")
+        });
+      }
+      const [healthResult, activityResult, ...metricResults] = await Promise.all([
         getResourceHealth(subscription, resourceId),
         getActivityLogs(subscription, hoursBack, resourceId),
-        metricConfig ? getMetrics(resourceId, metricConfig.names, hoursBack) : Promise.resolve({ data: null, error: void 0 })
+        ...metricPromises.map((m) => m.promise)
       ]);
+      const allEvents = [];
       if (healthResult.error) {
         errors.push(healthResult.error);
       } else if (healthResult.statuses.length > 0) {
@@ -24593,10 +23855,10 @@ function registerPlayback(server2) {
         const availState = status.properties?.availabilityState ?? "Unknown";
         if (availState !== "Available") {
           allEvents.push({
-            time: (/* @__PURE__ */ new Date()).toISOString(),
+            timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+            type: "health",
             event: `Health status: ${availState} \u2014 ${status.properties?.summary ?? ""}`,
             source: "ResourceHealth",
-            resource: resourceName,
             severity: availState === "Unavailable" ? "critical" : "warning"
           });
         }
@@ -24607,118 +23869,104 @@ function registerPlayback(server2) {
         for (const event of activityResult.events) {
           const opName = event.operationName?.localizedValue ?? event.operationName?.value ?? "Unknown operation";
           const status = event.status?.value ?? "";
+          const op = event.operationName?.value ?? "";
           const timestamp = event.eventTimestamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString();
-          allEvents.push({
-            time: timestamp,
-            event: `${opName} (${status})`,
-            source: "ActivityLog",
-            resource: resourceName,
-            actor: event.caller,
-            severity: status === "Failed" ? "warning" : "info"
-          });
-        }
-      }
-      if (metricsResult.error) {
-        errors.push(metricsResult.error);
-      } else if (metricsResult.data && metricConfig) {
-        for (const metric of metricsResult.data.metrics) {
-          for (const ts of metric.timeseries) {
-            if (!ts.data) continue;
-            const dataPoints = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0).map((dp) => ({
-              timestamp: dp.timeStamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString(),
-              average: dp.average ?? void 0,
-              maximum: dp.maximum ?? void 0
-            }));
-            const anomalies = detectMetricAnomalies(
-              resourceId,
-              metric.name,
-              dataPoints,
-              {
-                warningPct: metricConfig.warningPct,
-                criticalPct: metricConfig.criticalPct
-              }
-            );
-            allEvents.push(...anomalies);
+          const isNotable = status === "Failed" || op.includes("write") || op.includes("deploy") || op.includes("restart") || op.includes("delete") || op.includes("action") || op.includes("start") || op.includes("stop");
+          if (isNotable) {
+            allEvents.push({
+              timestamp,
+              type: "activity",
+              event: `${opName} (${status})`,
+              source: "ActivityLog",
+              actor: event.caller,
+              severity: status === "Failed" ? "warning" : "info"
+            });
           }
         }
       }
-      const correlation = correlateTimelines(allEvents);
-      const windowEvents = correlation.timeline.filter((e) => {
-        const t = new Date(e.time).getTime();
+      for (let i = 0; i < metricResults.length; i++) {
+        const result = metricResults[i];
+        const meta = metricPromises[i];
+        if (result.error) {
+          errors.push(result.error);
+          continue;
+        }
+        if (!result.data) continue;
+        for (const metric of result.data.metrics) {
+          const defUnit = metricDefs.definitions.find((d) => d.name === metric.name)?.unit ?? metric.unit ?? "Unspecified";
+          for (const ts of metric.timeseries) {
+            if (!ts.data) continue;
+            for (const dp of ts.data) {
+              const value = dp.average ?? dp.maximum ?? dp.total;
+              if (value === void 0) continue;
+              const pointTime = dp.timeStamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString();
+              allEvents.push({
+                timestamp: pointTime,
+                type: "metric",
+                event: `${metric.name}: ${Math.round(value * 100) / 100} ${defUnit}`,
+                source: `Metrics (${meta?.label ?? "unknown"})`,
+                metricValue: Math.round(value * 100) / 100,
+                metricUnit: defUnit
+              });
+            }
+          }
+        }
+      }
+      const windowEvents = allEvents.filter((e) => {
+        const t = new Date(e.timestamp).getTime();
         return t >= startDate.getTime() && t <= endDate.getTime();
       });
+      windowEvents.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
       const anomalyEvents = windowEvents.filter(
-        (e) => e.source === "ResourceHealth" || e.source === "Metrics" || e.source === "ServiceHealth"
+        (e) => e.type === "health" || e.type === "activity" && e.severity === "warning" || e.severity === "critical"
       );
-      const firstAnomalyTime = anomalyEvents.length > 0 ? new Date(anomalyEvents[0].time).getTime() : null;
-      const lastAnomalyTime = anomalyEvents.length > 0 ? new Date(anomalyEvents[anomalyEvents.length - 1].time).getTime() : null;
+      const firstAnomalyTime = anomalyEvents.length > 0 ? new Date(anomalyEvents[0].timestamp).getTime() : null;
+      const lastAnomalyTime = anomalyEvents.length > 0 ? new Date(anomalyEvents[anomalyEvents.length - 1].timestamp).getTime() : null;
       let resolutionTime = null;
       if (lastAnomalyTime !== null) {
         const postAnomalyChanges = windowEvents.filter((e) => {
-          const t = new Date(e.time).getTime();
-          return t > lastAnomalyTime && e.source === "ActivityLog";
+          const t = new Date(e.timestamp).getTime();
+          return t > lastAnomalyTime && e.type === "activity" && e.severity !== "warning";
         });
         if (postAnomalyChanges.length > 0) {
-          resolutionTime = new Date(postAnomalyChanges[0].time).getTime();
+          resolutionTime = new Date(postAnomalyChanges[0].timestamp).getTime();
         }
       }
-      const timeline = windowEvents.map((e) => {
-        const t = new Date(e.time).getTime();
-        let phaseMarker;
+      for (const e of windowEvents) {
+        const t = new Date(e.timestamp).getTime();
         if (firstAnomalyTime === null) {
-          phaseMarker = "pre-incident";
+          e.phaseMarker = "pre-incident";
         } else if (t < firstAnomalyTime) {
-          phaseMarker = "pre-incident";
-        } else if (t === firstAnomalyTime && anomalyEvents[0] === e) {
-          phaseMarker = "incident-start";
+          e.phaseMarker = "pre-incident";
+        } else if (t === firstAnomalyTime && e === anomalyEvents[0]) {
+          e.phaseMarker = "incident-start";
         } else if (lastAnomalyTime !== null && t <= lastAnomalyTime) {
-          phaseMarker = "during-incident";
-        } else if (resolutionTime !== null && t <= resolutionTime && e.source === "ActivityLog") {
-          phaseMarker = "resolution";
+          e.phaseMarker = "during-incident";
+        } else if (resolutionTime !== null && t <= resolutionTime && e.type === "activity") {
+          e.phaseMarker = "resolution";
         } else if (lastAnomalyTime !== null && t > lastAnomalyTime) {
-          phaseMarker = "post-incident";
+          e.phaseMarker = "post-incident";
         } else {
-          phaseMarker = "during-incident";
+          e.phaseMarker = "during-incident";
         }
-        const entry = {
-          timestamp: e.time,
-          event: e.event,
-          source: e.source,
-          actor: e.actor,
-          severity: e.severity,
-          phaseMarker
-        };
-        if (includeContext) {
-          entry.context = generateContext(e);
-        }
-        return entry;
-      });
-      const preIncidentCount = timeline.filter((e) => e.phaseMarker === "pre-incident").length;
-      const duringIncidentCount = timeline.filter((e) => e.phaseMarker === "during-incident").length;
-      const postIncidentCount = timeline.filter((e) => e.phaseMarker === "post-incident").length;
-      const incidentStartTimestamp = firstAnomalyTime ? new Date(firstAnomalyTime).toISOString() : null;
-      const resolutionTimestamp = resolutionTime ? new Date(resolutionTime).toISOString() : null;
+      }
       const durationMs = endDate.getTime() - startDate.getTime();
       const durationHours = Math.floor(durationMs / (60 * 60 * 1e3));
       const durationMinutes = Math.floor(durationMs % (60 * 60 * 1e3) / (60 * 1e3));
       const durationStr = durationHours > 0 ? `${durationHours}h ${durationMinutes}m` : `${durationMinutes}m`;
-      let summary = `${timeline.length} events over ${durationStr}.`;
-      if (incidentStartTimestamp) {
-        const startUtc = incidentStartTimestamp.replace("T", " ").replace(/\.\d+Z$/, " UTC");
-        summary += ` Incident started at ${startUtc}`;
-        if (resolutionTimestamp) {
-          const resolveUtc = resolutionTimestamp.replace("T", " ").replace(/\.\d+Z$/, " UTC");
-          summary += `, resolved at ${resolveUtc}.`;
-        } else {
-          summary += `, no clear resolution detected.`;
-        }
-      } else {
-        summary += " No anomalies detected in the playback window.";
-      }
+      const preIncidentCount = windowEvents.filter((e) => e.phaseMarker === "pre-incident").length;
+      const duringIncidentCount = windowEvents.filter((e) => e.phaseMarker === "during-incident").length;
+      const postIncidentCount = windowEvents.filter((e) => e.phaseMarker === "post-incident").length;
+      const incidentStartTimestamp = firstAnomalyTime ? new Date(firstAnomalyTime).toISOString() : null;
+      const resolutionTimestamp = resolutionTime ? new Date(resolutionTime).toISOString() : null;
       const response = {
         resource: resourceName,
+        resourceType,
         playbackWindow: `${startDate.toISOString()} to ${endDate.toISOString()}`,
-        totalEvents: timeline.length,
+        duration: durationStr,
+        totalEvents: windowEvents.length,
+        metricsDiscovered: selectedMetrics.length + parentMetricNames.length,
+        parentResource: parentResourceId ? { id: parentResourceId, label: parentLabel } : void 0,
         phases: {
           preIncident: preIncidentCount,
           incidentStart: incidentStartTimestamp,
@@ -24726,8 +23974,7 @@ function registerPlayback(server2) {
           resolution: resolutionTimestamp,
           postIncident: postIncidentCount
         },
-        timeline,
-        summary,
+        timeline: windowEvents,
         errors: errors.length > 0 ? errors : void 0
       };
       return {
@@ -24738,46 +23985,9 @@ function registerPlayback(server2) {
     }
   );
 }
-function generateContext(event) {
-  const e = event.event.toLowerCase();
-  if (event.source === "ActivityLog") {
-    if (e.includes("write")) {
-      return "A configuration change was made to the resource.";
-    }
-    if (e.includes("delete")) {
-      return "A resource or component was deleted.";
-    }
-    if (e.includes("failed")) {
-      return "This operation failed \u2014 check if it's related to the incident.";
-    }
-    return "An activity log event was recorded.";
-  }
-  if (event.source === "ResourceHealth") {
-    if (e.includes("unavailable")) {
-      return "Azure detected the resource as unavailable. This typically means the resource cannot serve requests.";
-    }
-    if (e.includes("degraded")) {
-      return "The resource is experiencing reduced functionality or performance.";
-    }
-    return "A resource health status change was detected.";
-  }
-  if (event.source === "Metrics") {
-    if (event.severity === "critical") {
-      return "This metric exceeded the critical threshold, indicating severe resource pressure.";
-    }
-    if (event.severity === "warning") {
-      return "This metric is elevated and approaching critical levels.";
-    }
-    return "A metric anomaly was detected.";
-  }
-  if (event.source === "ServiceHealth") {
-    return "An Azure platform event was reported that may affect this resource.";
-  }
-  return "An event was recorded.";
-}
 
 // src/tools/alertRules.ts
-var PARENT_METRIC_RESOURCES3 = {
+var PARENT_METRIC_RESOURCES4 = {
   "microsoft.web/sites": { property: "properties.serverFarmId", label: "App Service Plan" }
 };
 var ALERTABLE_PATTERNS = [
@@ -25048,7 +24258,7 @@ function registerAlertRules(server2) {
         return (aIdx === -1 ? 999 : aIdx) - (bIdx === -1 ? 999 : bIdx);
       });
       let recommendations = buildRecommendations(sortedDefs, resourceId, resourceName);
-      const parentConfig = PARENT_METRIC_RESOURCES3[resourceType.toLowerCase()];
+      const parentConfig = PARENT_METRIC_RESOURCES4[resourceType.toLowerCase()];
       let parentResourceId = null;
       let parentLabel = null;
       if (parentConfig) {
@@ -25332,6 +24542,11 @@ function registerSweep(server2) {
 }
 
 // src/tools/baseline.ts
+var PARENT_METRIC_RESOURCES5 = {
+  "microsoft.web/sites": { property: "properties.serverFarmId", label: "App Service Plan" }
+};
+var MAX_METRICS4 = 15;
+var PRIORITY_PATTERNS = [/percent/i, /cpu/i, /memory/i, /error/i, /5xx/i, /4xx/i, /fail/i, /latency/i, /response.*time/i, /request/i, /connection/i, /dtu/i, /throughput/i, /availability/i, /queue/i, /count/i];
 function calculateMean(values) {
   if (values.length === 0) return 0;
   return values.reduce((sum, v) => sum + v, 0) / values.length;
@@ -25344,196 +24559,196 @@ function calculateStdDev(values, mean) {
   );
   return Math.sqrt(sumSquaredDiffs / (values.length - 1));
 }
+function sortByPriority(defs) {
+  return [...defs].sort((a, b) => {
+    const aScore = PRIORITY_PATTERNS.findIndex((p) => p.test(a.name));
+    const bScore = PRIORITY_PATTERNS.findIndex((p) => p.test(b.name));
+    return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+  });
+}
 function registerBaseline(server2) {
   server2.tool(
     "azdoctor_baseline",
-    "Compare current resource metrics against their 7-day baseline. Flags deviations beyond 2 standard deviations to answer 'is this normal?'",
+    "Compare current resource metrics against their 7-day baseline using z-scores. Dynamically discovers available metrics \u2014 no hardcoded resource knowledge. Returns raw statistical data for AI analysis.",
     {
       resource: external_exports.string().describe("Resource name or full Azure resource ID"),
-      subscription: external_exports.string().optional(),
-      resourceGroup: external_exports.string().optional(),
+      subscription: external_exports.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
+      resourceGroup: external_exports.string().optional().describe("Resource group name (helps resolve resource ID faster)"),
       baselineDays: external_exports.number().default(7).describe("Days of history to use as baseline")
     },
     async ({ resource, subscription: subParam, resourceGroup, baselineDays }) => {
       const subscription = await resolveSubscription(subParam);
-      let resourceId;
-      let resourceType;
-      if (resource.startsWith("/")) {
-        resourceId = resource;
-        const typeMatch = resource.match(
-          /\/providers\/([^/]+\/[^/]+)/i
-        );
-        resourceType = typeMatch ? typeMatch[1] : "unknown";
+      const errors = [];
+      let resourceId = resource;
+      let resourceType = "unknown";
+      let resourceName = resource;
+      let resolvedRG = resourceGroup;
+      let resourceProperties = {};
+      if (!resource.startsWith("/subscriptions/")) {
+        const rgFilter = resolvedRG ? `| where resourceGroup =~ '${resolvedRG}'` : "";
+        const q = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup, properties | take 1`;
+        const result = await queryResourceGraph([subscription], q);
+        if (result.resources.length > 0) {
+          const r = result.resources[0];
+          resourceId = r.id;
+          resourceType = r.type ?? "unknown";
+          resourceName = r.name ?? resource;
+          resolvedRG = r.resourceGroup ?? resourceGroup;
+          resourceProperties = r.properties ?? {};
+        } else if (result.error) {
+          errors.push(result.error);
+        }
       } else {
-        const query = resourceGroup ? `Resources | where name =~ '${resource}' and resourceGroup =~ '${resourceGroup}' | project id, name, type | take 1` : `Resources | where name =~ '${resource}' | project id, name, type | take 1`;
-        const rgResult = await queryResourceGraph([subscription], query);
-        if (rgResult.error) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify(
-                  {
-                    error: `Failed to resolve resource: ${rgResult.error.message}`
-                  },
-                  null,
-                  2
-                )
-              }
-            ]
-          };
-        }
-        if (rgResult.resources.length === 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify(
-                  {
-                    error: `Resource '${resource}' not found in subscription ${subscription}${resourceGroup ? ` / resource group ${resourceGroup}` : ""}.`
-                  },
-                  null,
-                  2
-                )
-              }
-            ]
-          };
-        }
-        const resolved = rgResult.resources[0];
-        resourceId = resolved.id;
-        resourceType = resolved.type;
+        const parts = resource.split("/");
+        resourceName = parts[parts.length - 1] ?? resource;
+        const pi = parts.indexOf("providers");
+        if (pi !== -1 && parts.length > pi + 2) resourceType = `${parts[pi + 1]}/${parts[pi + 2]}`;
+        const ri = parts.indexOf("resourceGroups");
+        if (ri !== -1 && parts.length > ri + 1) resolvedRG = parts[ri + 1];
       }
-      const metricConfig = getMetricConfig(resourceType);
-      if (!metricConfig) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  error: `No metric configuration found for resource type '${resourceType}'. Baseline comparison is not supported for this resource type.`
-                },
-                null,
-                2
-              )
-            }
-          ]
-        };
+      const metricDefs = await listMetricDefinitions(resourceId);
+      if (metricDefs.error) errors.push(metricDefs.error);
+      const sortedDefs = sortByPriority(metricDefs.definitions);
+      const selectedMetrics = sortedDefs.slice(0, MAX_METRICS4).map((d) => d.name);
+      const parentConfig = PARENT_METRIC_RESOURCES5[resourceType.toLowerCase()];
+      let parentResourceId = null;
+      let parentLabel = null;
+      if (parentConfig) {
+        const propPath = parentConfig.property.replace("properties.", "");
+        const parentId = resourceProperties[propPath];
+        if (parentId) {
+          parentResourceId = parentId;
+          parentLabel = parentConfig.label;
+        } else {
+          const parentQuery = `Resources | where type =~ '${resourceType}' and name =~ '${resourceName}' | project parentId = ${parentConfig.property} | take 1`;
+          const parentResult = await queryResourceGraph([subscription], parentQuery);
+          if (parentResult.resources.length > 0) {
+            parentResourceId = parentResult.resources[0]["parentId"] ?? null;
+            parentLabel = parentConfig.label;
+          }
+        }
       }
-      const timespanHours = baselineDays * 24;
-      const metricsResult = await getMetrics(
-        resourceId,
-        metricConfig.names,
-        timespanHours,
-        "PT1H"
+      let parentMetricNames = [];
+      let parentMetricDefs = { definitions: [] };
+      if (parentResourceId) {
+        parentMetricDefs = await listMetricDefinitions(parentResourceId);
+        if (parentMetricDefs.error) errors.push(parentMetricDefs.error);
+        const parentSorted = sortByPriority(parentMetricDefs.definitions);
+        parentMetricNames = parentSorted.slice(0, MAX_METRICS4).map((d) => d.name);
+      }
+      const targets = [];
+      if (selectedMetrics.length > 0) {
+        targets.push({
+          label: resourceName,
+          resourceId,
+          metricNames: selectedMetrics,
+          defs: metricDefs.definitions
+        });
+      }
+      if (parentResourceId && parentMetricNames.length > 0) {
+        targets.push({
+          label: parentLabel ?? "parent",
+          resourceId: parentResourceId,
+          metricNames: parentMetricNames,
+          defs: parentMetricDefs.definitions
+        });
+      }
+      const currentPromises = targets.map(
+        (t) => getMetrics(t.resourceId, t.metricNames, 1, "PT5M")
       );
-      if (metricsResult.error) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  error: `Failed to retrieve metrics: ${metricsResult.error.message}`
-                },
-                null,
-                2
-              )
-            }
-          ]
-        };
-      }
-      if (!metricsResult.data) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                { error: "No metric data returned." },
-                null,
-                2
-              )
-            }
-          ]
-        };
-      }
+      const baselinePromises = targets.map(
+        (t) => getMetrics(t.resourceId, t.metricNames, baselineDays * 24, "PT1H")
+      );
+      const allResults = await Promise.all([...currentPromises, ...baselinePromises]);
+      const currentResults = allResults.slice(0, targets.length);
+      const baselineResults = allResults.slice(targets.length);
       const baselineMetrics = [];
-      for (const metric of metricsResult.data.metrics) {
-        const metricName = metric.name;
-        const timeSeries = metric.timeseries;
-        if (!timeSeries || timeSeries.length === 0) continue;
-        const allValues = [];
-        let lastValue = null;
-        for (const ts of timeSeries) {
-          const dataPoints = ts.data ?? [];
-          for (const dp of dataPoints) {
-            const val = dp.average ?? dp.maximum;
-            if (val !== void 0 && val !== null) {
-              allValues.push(val);
-              lastValue = val;
+      for (let i = 0; i < targets.length; i++) {
+        const target = targets[i];
+        const currentResult = currentResults[i];
+        const baselineResult = baselineResults[i];
+        if (currentResult.error) errors.push(currentResult.error);
+        if (baselineResult.error) errors.push(baselineResult.error);
+        if (!currentResult.data || !baselineResult.data) continue;
+        const currentValues = /* @__PURE__ */ new Map();
+        for (const metric of currentResult.data.metrics) {
+          for (const ts of metric.timeseries) {
+            if (!ts.data) continue;
+            const points = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0 || dp.total !== void 0).map((dp) => dp.average ?? dp.total ?? 0);
+            if (points.length > 0) {
+              currentValues.set(metric.name, points[points.length - 1]);
             }
           }
         }
-        if (allValues.length < 2 || lastValue === null) continue;
-        const mean = calculateMean(allValues);
-        const stddev = calculateStdDev(allValues, mean);
-        const current = lastValue;
-        const zScore = stddev > 0 ? (current - mean) / stddev : 0;
-        const absZ = Math.abs(zScore);
-        let status;
-        if (absZ >= 2) {
-          status = "anomalous";
-        } else if (absZ >= 1) {
-          status = "elevated";
-        } else {
-          status = "normal";
+        for (const metric of baselineResult.data.metrics) {
+          for (const ts of metric.timeseries) {
+            if (!ts.data) continue;
+            const allValues = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0 || dp.total !== void 0).map((dp) => dp.average ?? dp.total ?? 0);
+            if (allValues.length < 2) continue;
+            const current = currentValues.get(metric.name);
+            if (current === void 0) continue;
+            const mean = calculateMean(allValues);
+            const stddev = calculateStdDev(allValues, mean);
+            const zScore = stddev > 0 ? (current - mean) / stddev : 0;
+            const absZ = Math.abs(zScore);
+            let status;
+            if (absZ >= 2) {
+              status = "anomalous";
+            } else if (absZ >= 1) {
+              status = "elevated";
+            } else {
+              status = "normal";
+            }
+            let direction;
+            if (zScore > 0.1) {
+              direction = "above";
+            } else if (zScore < -0.1) {
+              direction = "below";
+            } else {
+              direction = "at";
+            }
+            const defUnit = target.defs.find((d) => d.name === metric.name)?.unit ?? metric.unit ?? "Unspecified";
+            baselineMetrics.push({
+              metricName: metric.name,
+              source: target.label,
+              unit: defUnit,
+              current: Math.round(current * 100) / 100,
+              baselineMean: Math.round(mean * 100) / 100,
+              baselineStdDev: Math.round(stddev * 100) / 100,
+              zScore: Math.round(zScore * 100) / 100,
+              status,
+              direction
+            });
+          }
         }
-        let direction;
-        if (zScore > 0.1) {
-          direction = "above";
-        } else if (zScore < -0.1) {
-          direction = "below";
-        } else {
-          direction = "at";
-        }
-        const description = `${metricName} is ${absZ.toFixed(1)} standard deviations ${direction} the ${baselineDays}-day average (current: ${current.toFixed(1)}%, avg: ${mean.toFixed(1)}%)`;
-        baselineMetrics.push({
-          metricName,
-          current: Math.round(current * 100) / 100,
-          baselineMean: Math.round(mean * 100) / 100,
-          baselineStdDev: Math.round(stddev * 100) / 100,
-          zScore: Math.round(zScore * 100) / 100,
-          status,
-          direction,
-          description
-        });
-      }
-      const anomalousCount = baselineMetrics.filter(
-        (m) => m.status === "anomalous"
-      ).length;
-      const elevatedCount = baselineMetrics.filter(
-        (m) => m.status === "elevated"
-      ).length;
-      let overallStatus;
-      if (anomalousCount >= 2) {
-        overallStatus = "significant_anomalies";
-      } else if (anomalousCount >= 1 || elevatedCount >= 2) {
-        overallStatus = "some_anomalies";
-      } else {
-        overallStatus = "normal";
       }
       const response = {
-        resource: resourceId,
+        resource: resourceName,
         resourceType,
+        resourceGroup: resolvedRG,
         baselineDays,
-        overallStatus,
-        metrics: baselineMetrics,
         timestamp: (/* @__PURE__ */ new Date()).toISOString()
       };
+      if (baselineMetrics.length > 0) {
+        response.metrics = baselineMetrics;
+      } else if (metricDefs.definitions.length === 0 && parentMetricNames.length === 0) {
+        response.metrics = "This resource type does not emit Azure Monitor metrics.";
+      } else {
+        response.metrics = `Metrics discovered but no data returned for the analysis window.`;
+      }
+      const allDefCount = metricDefs.definitions.length + parentMetricDefs.definitions.length;
+      const allPulledCount = selectedMetrics.length + parentMetricNames.length;
+      if (allDefCount > allPulledCount) {
+        response.additionalMetricsAvailable = [
+          ...metricDefs.definitions.slice(MAX_METRICS4).map((d) => d.name),
+          ...parentMetricDefs.definitions.slice(MAX_METRICS4).map((d) => d.name)
+        ];
+      }
+      if (errors.length > 0) {
+        response.apiErrors = errors.map((e) => `${e.code}: ${e.message}`);
+      }
       return {
-        content: [
-          { type: "text", text: JSON.stringify(response, null, 2) }
-        ]
+        content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
       };
     }
   );
@@ -26277,37 +25492,688 @@ function registerPlaybooks(server2) {
   );
 }
 
-// src/utils/formatters.ts
-function formatErrorSummary(errors) {
-  const permissionGaps = [];
-  const otherErrors = [];
-  for (const err of errors) {
-    if (err.code === "FORBIDDEN") {
-      permissionGaps.push({
-        api: err.message,
-        recommendation: err.roleRecommendation ?? "Check required RBAC roles"
-      });
-    } else {
-      otherErrors.push({ api: err.code, message: err.message });
-    }
+// src/tools/triage.ts
+import { mkdirSync as mkdirSync3, writeFileSync as writeFileSync3 } from "node:fs";
+import { join as join3 } from "node:path";
+import { homedir as homedir3 } from "node:os";
+var PARENT_METRIC_RESOURCES6 = {
+  "microsoft.web/sites": { property: "properties.serverFarmId", label: "App Service Plan" }
+};
+var MAX_METRICS5 = 15;
+var JOURNAL_DIR2 = join3(homedir3(), ".azdoctor", "journal");
+function ensureJournalDir2() {
+  mkdirSync3(JOURNAL_DIR2, { recursive: true });
+}
+function formatDateForFilename(date3) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date3.getFullYear()}-${pad(date3.getMonth() + 1)}-${pad(date3.getDate())}-${pad(date3.getHours())}${pad(date3.getMinutes())}${pad(date3.getSeconds())}`;
+}
+function sanitizeResourceName2(resource) {
+  return resource.replace(/[/\\:*?"<>|]/g, "-").replace(/\s+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "").toLowerCase();
+}
+function computeBaseline(dataPoints, metricName) {
+  const values = [];
+  for (const dp of dataPoints) {
+    const v = dp.average ?? dp.maximum;
+    if (v !== void 0) values.push(v);
   }
-  let message;
-  if (errors.length === 0) {
-    message = "All APIs accessible \u2014 full diagnostic data available.";
-  } else if (otherErrors.length === 0) {
-    message = `${permissionGaps.length} API(s) inaccessible due to permissions \u2014 results may be incomplete. Run azdoctor_check_permissions for details.`;
-  } else if (permissionGaps.length === 0) {
-    message = `${otherErrors.length} API call(s) failed \u2014 some diagnostic data may be missing.`;
+  if (values.length < 2) return null;
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  const variance = values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / values.length;
+  const stdDev = Math.sqrt(variance);
+  const current = values[values.length - 1];
+  const zScore = stdDev !== 0 ? (current - mean) / stdDev : 0;
+  let status;
+  if (Math.abs(zScore) < 1) {
+    status = "normal";
+  } else if (Math.abs(zScore) < 2) {
+    status = "elevated";
   } else {
-    message = `${permissionGaps.length} API(s) inaccessible due to permissions \u2014 results may be incomplete. Run azdoctor_check_permissions for details. ${otherErrors.length} API call(s) failed \u2014 some diagnostic data may be missing.`;
+    status = "anomalous";
   }
   return {
-    totalErrors: errors.length,
-    permissionGaps,
-    otherErrors,
-    message
+    metric: metricName,
+    current: Math.round(current * 100) / 100,
+    mean: Math.round(mean * 100) / 100,
+    stdDev: Math.round(stdDev * 100) / 100,
+    zScore: Math.round(zScore * 100) / 100,
+    status
   };
 }
+var PRIORITY_PATTERNS2 = [
+  /percent/i,
+  /cpu/i,
+  /memory/i,
+  /error/i,
+  /5xx/i,
+  /4xx/i,
+  /fail/i,
+  /latency/i,
+  /response.*time/i,
+  /request/i,
+  /connection/i,
+  /dtu/i,
+  /throughput/i,
+  /availability/i,
+  /queue/i,
+  /count/i
+];
+function sortAndSelectMetrics(definitions, max) {
+  const sorted = [...definitions].sort((a, b) => {
+    const aScore = PRIORITY_PATTERNS2.findIndex((p) => p.test(a.name));
+    const bScore = PRIORITY_PATTERNS2.findIndex((p) => p.test(b.name));
+    return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+  });
+  return {
+    selected: sorted.slice(0, max).map((d) => d.name),
+    all: sorted
+  };
+}
+function generateAlertRecommendations(definitions, metricSummaries) {
+  const alerts = [];
+  const thresholdRules = [
+    { pattern: /percent|percentage/i, threshold: 85, reason: "Percentage metric approaching saturation" },
+    { pattern: /cpu/i, threshold: 85, reason: "High CPU can cause request queuing and timeouts" },
+    { pattern: /memory/i, threshold: 85, reason: "High memory can lead to OOM crashes" },
+    { pattern: /5xx|error/i, threshold: 10, reason: "Server errors indicate application or infrastructure problems" },
+    { pattern: /4xx/i, threshold: 50, reason: "High client error rate may indicate misconfiguration or attack" },
+    { pattern: /latency|response.*time/i, threshold: 5e3, reason: "Slow responses degrade user experience" },
+    { pattern: /fail/i, threshold: 5, reason: "Failures indicate connectivity or reliability issues" },
+    { pattern: /deadlock/i, threshold: 1, reason: "Any deadlock should be investigated immediately" },
+    { pattern: /queue.*depth|queue.*length/i, threshold: 10, reason: "Growing queues indicate a bottleneck" },
+    { pattern: /dtu/i, threshold: 90, reason: "DTU saturation causes query throttling" },
+    { pattern: /server.*load/i, threshold: 80, reason: "High server load degrades all operations" }
+  ];
+  for (const def of definitions) {
+    for (const rule of thresholdRules) {
+      if (rule.pattern.test(def.name)) {
+        const summary = metricSummaries.find((m) => m.name === def.name);
+        let suggestedThreshold = rule.threshold;
+        if (summary && !/percent|percentage/i.test(def.name)) {
+          const observedMax = summary.max;
+          if (observedMax > 0 && observedMax > suggestedThreshold) {
+            suggestedThreshold = Math.max(rule.threshold, Math.round(observedMax * 2));
+          }
+        }
+        alerts.push({
+          name: def.name,
+          metric: def.name,
+          suggestedThreshold,
+          unit: def.unit,
+          reason: rule.reason
+        });
+        break;
+      }
+    }
+  }
+  return alerts;
+}
+function buildJournalMarkdown(report) {
+  const baselineRows = report.baseline.metrics.length > 0 ? "| Metric | Current | Mean | StdDev | Z-Score | Status |\n|--------|---------|------|--------|---------|--------|\n" + report.baseline.metrics.map((m) => `| ${m.metric} | ${m.current} | ${m.mean} | ${m.stdDev} | ${m.zScore} | ${m.status} |`).join("\n") : "No baseline metrics available.";
+  const alertsBullets = report.alertRecommendations.length > 0 ? report.alertRecommendations.map((a) => `- **${a.name}**: ${a.reason} (threshold: ${a.suggestedThreshold} ${a.unit})`).join("\n") : "- No alert recommendations discovered for available metrics.";
+  const metricSection = Array.isArray(report.metrics) ? report.metrics.map((m) => `- **${m.name}** (${m.source}): current=${m.current}, avg=${m.avg}, max=${m.max} ${m.unit}`).join("\n") : String(report.metrics);
+  const changesSection = Array.isArray(report.recentChanges) ? report.recentChanges.map((c) => `- ${c.time}: ${c.operation} (${c.status}) by ${c.caller ?? "unknown"}`).join("\n") : String(report.recentChanges);
+  const depsSection = report.dependencies.length > 0 ? report.dependencies.map((d) => `- **${d.name}** (${d.type}): ${d.health} [${d.relationship}]`).join("\n") : "No dependencies discovered.";
+  const errorsSection = report.errors.length > 0 ? report.errors.map((e) => `- ${e.code}: ${e.message}`).join("\n") : "No API errors.";
+  return `# Triage Report: ${report.resource}
+**Date:** ${report.timestamp}
+**Type:** ${report.resourceType}
+**Resource Group:** ${report.resourceGroup ?? "unknown"}
+**Health:** ${report.currentHealth}
+**Duration:** ${report.triageDuration}
+${report.symptom ? `**Reported Symptom:** ${report.symptom}` : ""}
+
+## Permissions
+${report.permissions.summary}
+
+## Metrics
+${metricSection}
+
+## Recent Changes
+${changesSection}
+
+## Log Analytics
+${report.logAnalytics ? JSON.stringify(report.logAnalytics, null, 2) : "No Log Analytics workspace found."}
+
+## Dependencies
+${depsSection}
+
+## Baseline Comparison (${report.baseline.lookbackDays}-day)
+**Overall:** ${report.baseline.overallStatus}
+
+${baselineRows}
+
+## Recommended Alerts
+${alertsBullets}
+
+## API Errors
+${errorsSection}
+
+---
+*Auto-saved by AZ Doctor triage*
+`;
+}
+function registerTriage(server2) {
+  server2.tool(
+    "azdoctor_triage",
+    "Run the full diagnostic pipeline on a resource in one command. Chains: permission check \u2192 dynamic investigation \u2192 baseline comparison \u2192 alert recommendations \u2192 journal save. Returns ALL raw data \u2014 no hardcoded analysis or correlator. Uses dynamic metric discovery via listMetricDefinitions.",
+    {
+      resource: external_exports.string().describe("Resource name or full Azure resource ID"),
+      subscription: external_exports.string().optional().describe("Azure subscription ID (auto-detected if omitted)"),
+      resourceGroup: external_exports.string().optional().describe("Resource group name"),
+      symptom: external_exports.string().optional().describe("User-described symptom"),
+      timeframeHours: external_exports.number().default(24).describe("Investigation lookback window in hours"),
+      baselineDays: external_exports.number().default(7).describe("Baseline comparison lookback in days"),
+      saveToJournal: external_exports.boolean().default(true).describe("Auto-save the triage report to the incident journal"),
+      generateAlerts: external_exports.boolean().default(true).describe("Generate alert rule recommendations")
+    },
+    async ({
+      resource,
+      subscription: subParam,
+      resourceGroup,
+      symptom,
+      timeframeHours,
+      baselineDays,
+      saveToJournal,
+      generateAlerts
+    }) => {
+      const startTime = Date.now();
+      const errors = [];
+      const subscription = await resolveSubscription(subParam);
+      let resourceId = resource;
+      let resourceType = "unknown";
+      let resourceName = resource;
+      let resolvedRG = resourceGroup;
+      let resourceProperties = {};
+      if (!resource.startsWith("/subscriptions/")) {
+        const rgFilter = resolvedRG ? `| where resourceGroup =~ '${resolvedRG}'` : "";
+        const q = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup, properties | take 1`;
+        const result = await queryResourceGraph([subscription], q);
+        if (result.resources.length > 0) {
+          const r = result.resources[0];
+          resourceId = r.id;
+          resourceType = r.type ?? "unknown";
+          resourceName = r.name ?? resource;
+          resolvedRG = r.resourceGroup ?? resourceGroup;
+          resourceProperties = r.properties ?? {};
+        } else if (result.error) {
+          errors.push(result.error);
+        }
+      } else {
+        const parts = resource.split("/");
+        resourceName = parts[parts.length - 1] ?? resource;
+        const pi = parts.indexOf("providers");
+        if (pi !== -1 && parts.length > pi + 2) resourceType = `${parts[pi + 1]}/${parts[pi + 2]}`;
+        const ri = parts.indexOf("resourceGroups");
+        if (ri !== -1 && parts.length > ri + 1) resolvedRG = parts[ri + 1];
+      }
+      const permissionsCheck = {
+        resourceGraph: true,
+        // Already succeeded if we got here
+        resourceHealth: false,
+        activityLog: false,
+        metrics: false,
+        logAnalytics: false,
+        summary: ""
+      };
+      const metricDefs = await listMetricDefinitions(resourceId);
+      if (metricDefs.error) errors.push(metricDefs.error);
+      permissionsCheck.metrics = !metricDefs.error;
+      const { selected: selectedMetrics, all: allMetricDefs } = sortAndSelectMetrics(metricDefs.definitions, MAX_METRICS5);
+      const parentConfig = PARENT_METRIC_RESOURCES6[resourceType.toLowerCase()];
+      let parentResourceId = null;
+      let parentLabel = null;
+      if (parentConfig) {
+        const propPath = parentConfig.property.replace("properties.", "");
+        const parentId = resourceProperties[propPath];
+        if (parentId) {
+          parentResourceId = parentId;
+          parentLabel = parentConfig.label;
+        } else {
+          const parentQuery = `Resources | where type =~ '${resourceType}' and name =~ '${resourceName}' | project parentId = ${parentConfig.property} | take 1`;
+          const parentResult = await queryResourceGraph([subscription], parentQuery);
+          if (parentResult.resources.length > 0) {
+            parentResourceId = parentResult.resources[0]["parentId"] ?? null;
+            parentLabel = parentConfig.label;
+          }
+        }
+      }
+      let parentMetricNames = [];
+      if (parentResourceId) {
+        const parentDefs = await listMetricDefinitions(parentResourceId);
+        if (parentDefs.error) errors.push(parentDefs.error);
+        const parentSorted = sortAndSelectMetrics(parentDefs.definitions, MAX_METRICS5);
+        parentMetricNames = parentSorted.selected;
+      }
+      const metricPromises = [];
+      if (selectedMetrics.length > 0) {
+        metricPromises.push({
+          label: resourceName,
+          resourceId,
+          promise: getMetrics(resourceId, selectedMetrics, timeframeHours, "PT5M")
+        });
+      }
+      if (parentResourceId && parentMetricNames.length > 0) {
+        metricPromises.push({
+          label: `${parentLabel ?? "parent"}`,
+          resourceId: parentResourceId,
+          promise: getMetrics(parentResourceId, parentMetricNames, timeframeHours, "PT5M")
+        });
+      }
+      const [healthResult, activityResult, ...metricResults] = await Promise.all([
+        getResourceHealth(subscription, resourceId),
+        getActivityLogs(subscription, timeframeHours, resourceId),
+        ...metricPromises.map((m) => m.promise)
+      ]);
+      permissionsCheck.resourceHealth = !healthResult.error;
+      permissionsCheck.activityLog = !activityResult.error;
+      let currentHealth = "Unknown";
+      let healthDetails;
+      if (healthResult.error) {
+        errors.push(healthResult.error);
+      } else if (healthResult.statuses.length > 0) {
+        const status = healthResult.statuses[0];
+        currentHealth = status.properties?.availabilityState ?? "Unknown";
+        if (currentHealth !== "Available") {
+          healthDetails = {
+            state: currentHealth,
+            summary: status.properties?.summary,
+            reason: status.properties?.reasonType,
+            recommendedAction: status.properties?.recommendedActions?.[0]?.action
+          };
+        }
+      }
+      const recentChanges = [];
+      if (activityResult.error) {
+        errors.push(activityResult.error);
+      } else {
+        for (const event of activityResult.events) {
+          const status = event.status?.value ?? "";
+          const op = event.operationName?.value ?? "";
+          if (status === "Failed" || op.includes("write") || op.includes("deploy") || op.includes("restart") || op.includes("delete") || op.includes("action")) {
+            recentChanges.push({
+              time: event.eventTimestamp?.toISOString(),
+              operation: event.operationName?.localizedValue ?? op,
+              status,
+              caller: event.caller
+            });
+          }
+        }
+      }
+      const metricSummaries = [];
+      for (let i = 0; i < metricResults.length; i++) {
+        const result = metricResults[i];
+        const meta = metricPromises[i];
+        if (result.error) {
+          errors.push(result.error);
+          continue;
+        }
+        if (!result.data) continue;
+        for (const metric of result.data.metrics) {
+          for (const ts of metric.timeseries) {
+            if (!ts.data) continue;
+            const points = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0 || dp.total !== void 0).map((dp) => ({
+              time: dp.timeStamp?.toISOString() ?? "",
+              avg: dp.average ?? dp.total ?? 0,
+              max: dp.maximum ?? dp.average ?? dp.total ?? 0
+            }));
+            if (points.length === 0) continue;
+            const avgs = points.map((p) => p.avg);
+            const maxes = points.map((p) => p.max);
+            const defUnit = metricDefs.definitions.find((d) => d.name === metric.name)?.unit ?? metric.unit ?? "Unspecified";
+            metricSummaries.push({
+              name: metric.name,
+              source: meta?.label ?? "unknown",
+              unit: defUnit,
+              current: Math.round(avgs[avgs.length - 1] * 100) / 100,
+              max: Math.round(Math.max(...maxes) * 100) / 100,
+              avg: Math.round(avgs.reduce((a, b) => a + b, 0) / avgs.length * 100) / 100,
+              min: Math.round(Math.min(...avgs) * 100) / 100,
+              dataPoints: points.length,
+              recentValues: points.slice(-6).map((p) => ({ time: p.time, value: Math.round(p.avg * 100) / 100 }))
+            });
+          }
+        }
+      }
+      const dependencies = [];
+      if (resolvedRG) {
+        const depResourceIds = [];
+        if (resourceType.toLowerCase() === "microsoft.web/sites") {
+          const configQuery = `Resources
+| where type =~ 'microsoft.web/sites' and name =~ '${resourceName}' and resourceGroup =~ '${resolvedRG}'
+| project siteConfig = properties.siteConfig, serverFarmId = properties.serverFarmId
+| take 1`;
+          const configResult = await queryResourceGraph([subscription], configQuery);
+          const referencedNames = /* @__PURE__ */ new Set();
+          if (configResult.resources.length > 0) {
+            const config2 = configResult.resources[0];
+            const siteConfig = config2["siteConfig"];
+            const appSettings = siteConfig?.["appSettings"];
+            if (Array.isArray(appSettings)) {
+              for (const setting of appSettings) {
+                const val = String(setting.value ?? "");
+                const serverMatch = val.match(/(?:Server|Data Source|AccountEndpoint)=(?:tcp:)?([^;,]+)/i);
+                if (serverMatch) {
+                  const host = serverMatch[1].split(".")[0];
+                  referencedNames.add(host.toLowerCase());
+                }
+                const redisMatch = val.match(/([^.]+)\.redis\.cache\.windows\.net/i);
+                if (redisMatch) referencedNames.add(redisMatch[1].toLowerCase());
+                const storageMatch = val.match(/([^.]+)\.blob\.core\.windows\.net/i);
+                if (storageMatch) referencedNames.add(storageMatch[1].toLowerCase());
+                const cosmosMatch = val.match(/([^.]+)\.documents\.azure\.com/i);
+                if (cosmosMatch) referencedNames.add(cosmosMatch[1].toLowerCase());
+              }
+            }
+          }
+          if (referencedNames.size > 0) {
+            const nameFilter = Array.from(referencedNames).map((n) => `name =~ '${n}'`).join(" or ");
+            const refQuery = `Resources | where (${nameFilter}) | project id, name, type | take 20`;
+            const refResult = await queryResourceGraph([subscription], refQuery);
+            if (refResult.error) errors.push(refResult.error);
+            for (const dep of refResult.resources) {
+              depResourceIds.push({
+                id: dep.id,
+                name: dep.name,
+                type: dep.type,
+                relationship: "referenced in app settings"
+              });
+            }
+            for (const dep of [...depResourceIds]) {
+              if (dep.type.toLowerCase() === "microsoft.sql/servers") {
+                const dbQuery = `Resources | where type =~ 'microsoft.sql/servers/databases' and name != 'master' and resourceGroup =~ '${resolvedRG}' and id startswith '${dep.id}' | project id, name, type`;
+                const dbResult = await queryResourceGraph([subscription], dbQuery);
+                for (const db of dbResult.resources) {
+                  depResourceIds.push({
+                    id: db.id,
+                    name: db.name,
+                    type: db.type,
+                    relationship: `database on ${dep.name}`
+                  });
+                }
+              }
+            }
+          }
+          if (depResourceIds.length === 0) {
+            const fallbackQuery = `Resources
+| where resourceGroup =~ '${resolvedRG}'
+| where name != '${resourceName}'
+| where type in~ ('microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.servicebus/namespaces', 'microsoft.eventhub/namespaces')
+| where name != 'master'
+| project id, name, type
+| take 10`;
+            const fallbackResult = await queryResourceGraph([subscription], fallbackQuery);
+            if (fallbackResult.error) errors.push(fallbackResult.error);
+            for (const dep of fallbackResult.resources) {
+              depResourceIds.push({
+                id: dep.id,
+                name: dep.name,
+                type: dep.type,
+                relationship: "in same resource group"
+              });
+            }
+          }
+        } else {
+          const depQuery = `Resources
+| where resourceGroup =~ '${resolvedRG}'
+| where name != '${resourceName}'
+| where type in~ ('microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.web/sites', 'microsoft.compute/virtualmachines', 'microsoft.containerservice/managedclusters')
+| where name != 'master'
+| project id, name, type
+| take 10`;
+          const depResult = await queryResourceGraph([subscription], depQuery);
+          if (depResult.error) errors.push(depResult.error);
+          for (const dep of depResult.resources) {
+            depResourceIds.push({
+              id: dep.id,
+              name: dep.name,
+              type: dep.type,
+              relationship: "in same resource group"
+            });
+          }
+        }
+        if (depResourceIds.length > 0) {
+          const healthChecks = await batchExecute(
+            depResourceIds.map((dep) => async () => {
+              const h = await getResourceHealth(subscription, dep.id);
+              return {
+                name: dep.name,
+                type: dep.type,
+                health: h.statuses[0]?.properties?.availabilityState ?? "Unknown",
+                relationship: dep.relationship
+              };
+            }),
+            5
+          );
+          dependencies.push(...healthChecks);
+        }
+      }
+      let logData = null;
+      if (resolvedRG) {
+        const wsResult = await discoverWorkspaces(subscription, resolvedRG);
+        permissionsCheck.logAnalytics = !wsResult.error;
+        if (wsResult.workspaces.length > 0) {
+          const ws = wsResult.workspaces[0];
+          const [reqResult, excResult, depFail] = await Promise.all([
+            queryLogAnalytics(ws.workspaceId, `AppRequests
+| where TimeGenerated > ago(${timeframeHours}h)
+| where Success == false
+| summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by OperationName, ResultCode
+| order by Count desc
+| take 10`, timeframeHours),
+            queryLogAnalytics(ws.workspaceId, `AppExceptions
+| where TimeGenerated > ago(${timeframeHours}h)
+| summarize Count = count() by ExceptionType, OuterMessage
+| order by Count desc
+| take 10`, timeframeHours),
+            queryLogAnalytics(ws.workspaceId, `AppDependencies
+| where TimeGenerated > ago(${timeframeHours}h)
+| where Success == false
+| summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by Target, DependencyType = Type, ResultCode
+| order by Count desc
+| take 10`, timeframeHours)
+          ]);
+          if (reqResult.error) errors.push(reqResult.error);
+          if (excResult.error) errors.push(excResult.error);
+          if (depFail.error) errors.push(depFail.error);
+          logData = {
+            workspace: ws.workspaceName,
+            failedRequests: (reqResult.tables?.[0]?.rows ?? []).map((r) => ({
+              operation: String(r[0] ?? ""),
+              statusCode: String(r[1] ?? ""),
+              count: Number(r[2]) || 0,
+              avgDurationMs: Number(r[3]) || 0
+            })),
+            exceptions: (excResult.tables?.[0]?.rows ?? []).map((r) => ({
+              type: String(r[0] ?? ""),
+              message: String(r[1] ?? ""),
+              count: Number(r[2]) || 0
+            })),
+            dependencyFailures: (depFail.tables?.[0]?.rows ?? []).map((r) => ({
+              target: String(r[0] ?? ""),
+              type: String(r[1] ?? ""),
+              resultCode: String(r[2] ?? ""),
+              count: Number(r[3]) || 0,
+              avgDurationMs: Number(r[4]) || 0
+            }))
+          };
+        }
+      }
+      const baselineMetrics = [];
+      if (selectedMetrics.length > 0) {
+        const baselineHours = baselineDays * 24;
+        const baselineResult = await getMetrics(
+          resourceId,
+          selectedMetrics,
+          baselineHours,
+          "PT1H"
+        );
+        if (baselineResult.error) {
+          errors.push(baselineResult.error);
+        } else if (baselineResult.data) {
+          for (const metric of baselineResult.data.metrics) {
+            for (const ts of metric.timeseries) {
+              if (!ts.data) continue;
+              const dataPoints = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0).map((dp) => ({
+                timestamp: dp.timeStamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString(),
+                average: dp.average ?? void 0,
+                maximum: dp.maximum ?? void 0
+              }));
+              const bl = computeBaseline(dataPoints, metric.name);
+              if (bl) baselineMetrics.push(bl);
+            }
+          }
+        }
+      }
+      if (parentResourceId && parentMetricNames.length > 0) {
+        const parentBaselineResult = await getMetrics(
+          parentResourceId,
+          parentMetricNames,
+          baselineDays * 24,
+          "PT1H"
+        );
+        if (parentBaselineResult.error) {
+          errors.push(parentBaselineResult.error);
+        } else if (parentBaselineResult.data) {
+          for (const metric of parentBaselineResult.data.metrics) {
+            for (const ts of metric.timeseries) {
+              if (!ts.data) continue;
+              const dataPoints = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0).map((dp) => ({
+                timestamp: dp.timeStamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString(),
+                average: dp.average ?? void 0,
+                maximum: dp.maximum ?? void 0
+              }));
+              const bl = computeBaseline(dataPoints, `${parentLabel ?? "parent"}/${metric.name}`);
+              if (bl) baselineMetrics.push(bl);
+            }
+          }
+        }
+      }
+      const anomalousCount = baselineMetrics.filter((m) => m.status === "anomalous").length;
+      const elevatedCount = baselineMetrics.filter((m) => m.status === "elevated").length;
+      let baselineOverallStatus;
+      if (anomalousCount > 0) {
+        baselineOverallStatus = `${anomalousCount} metric(s) anomalous`;
+      } else if (elevatedCount > 0) {
+        baselineOverallStatus = `${elevatedCount} metric(s) elevated`;
+      } else {
+        baselineOverallStatus = "All metrics within normal range";
+      }
+      const alertRecommendations = generateAlerts ? generateAlertRecommendations(allMetricDefs, metricSummaries) : [];
+      const durationMs = Date.now() - startTime;
+      const triageDuration = `${(durationMs / 1e3).toFixed(1)}s`;
+      const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+      const accessibleAPIs = [];
+      const inaccessibleAPIs = [];
+      if (permissionsCheck.resourceGraph) accessibleAPIs.push("Resource Graph");
+      else inaccessibleAPIs.push("Resource Graph");
+      if (permissionsCheck.resourceHealth) accessibleAPIs.push("Resource Health");
+      else inaccessibleAPIs.push("Resource Health");
+      if (permissionsCheck.activityLog) accessibleAPIs.push("Activity Log");
+      else inaccessibleAPIs.push("Activity Log");
+      if (permissionsCheck.metrics) accessibleAPIs.push("Metrics");
+      else inaccessibleAPIs.push("Metrics");
+      if (permissionsCheck.logAnalytics) accessibleAPIs.push("Log Analytics");
+      else inaccessibleAPIs.push("Log Analytics");
+      permissionsCheck.summary = inaccessibleAPIs.length === 0 ? "All APIs accessible \u2014 full diagnostic data available." : `${accessibleAPIs.length}/5 APIs accessible. Inaccessible: ${inaccessibleAPIs.join(", ")}.`;
+      let journalSaved = false;
+      let journalPath;
+      if (saveToJournal) {
+        try {
+          ensureJournalDir2();
+          const now = /* @__PURE__ */ new Date();
+          const filename = `triage-${sanitizeResourceName2(resourceName)}-${formatDateForFilename(now)}.md`;
+          journalPath = join3(JOURNAL_DIR2, filename);
+          const markdownContent = buildJournalMarkdown({
+            resource: resourceName,
+            resourceType,
+            resourceGroup: resolvedRG,
+            timestamp,
+            triageDuration,
+            currentHealth,
+            healthDetails,
+            symptom,
+            permissions: permissionsCheck,
+            metrics: metricSummaries.length > 0 ? metricSummaries : "No metric data available.",
+            recentChanges: recentChanges.length > 0 ? recentChanges : "No notable changes.",
+            logAnalytics: logData ? logData.failedRequests.length > 0 || logData.exceptions.length > 0 || logData.dependencyFailures.length > 0 ? logData : { workspace: logData.workspace, summary: "No failed requests, exceptions, or dependency failures found." } : null,
+            dependencies,
+            baseline: {
+              overallStatus: baselineOverallStatus,
+              metrics: baselineMetrics,
+              lookbackDays: baselineDays
+            },
+            alertRecommendations,
+            errors
+          });
+          writeFileSync3(journalPath, markdownContent, "utf-8");
+          journalSaved = true;
+        } catch {
+          journalSaved = false;
+        }
+      }
+      const response = {
+        // Header
+        resource: resourceName,
+        resourceType,
+        resourceGroup: resolvedRG,
+        subscription,
+        timestamp,
+        triageDuration,
+        executionTimeMs: durationMs,
+        // Permissions
+        permissions: permissionsCheck,
+        // Health
+        currentHealth
+      };
+      if (healthDetails) response.healthDetails = healthDetails;
+      if (symptom) response.reportedSymptom = symptom;
+      if (metricSummaries.length > 0) {
+        response.metrics = metricSummaries;
+      } else if (selectedMetrics.length === 0 && metricDefs.definitions.length === 0) {
+        response.metrics = "This resource type does not emit Azure Monitor metrics.";
+      } else {
+        response.metrics = `Metrics requested (${selectedMetrics.join(", ")}) but no data returned for the ${timeframeHours}h window.`;
+      }
+      if (metricDefs.definitions.length > MAX_METRICS5) {
+        response.additionalMetricsAvailable = metricDefs.definitions.slice(MAX_METRICS5).map((d) => d.name);
+      }
+      if (recentChanges.length > 0) {
+        response.recentChanges = recentChanges;
+      } else {
+        response.recentChanges = "No write operations or failures in the activity log.";
+      }
+      if (logData) {
+        if (logData.failedRequests.length > 0 || logData.exceptions.length > 0 || logData.dependencyFailures.length > 0) {
+          response.logAnalytics = logData;
+        } else {
+          response.logAnalytics = { workspace: logData.workspace, summary: "No failed requests, exceptions, or dependency failures found." };
+        }
+      }
+      if (dependencies.length > 0) {
+        response.dependencies = dependencies;
+      }
+      response.baseline = {
+        overallStatus: baselineOverallStatus,
+        metrics: baselineMetrics,
+        lookbackDays: baselineDays
+      };
+      if (alertRecommendations.length > 0) {
+        response.alertRecommendations = alertRecommendations;
+      }
+      response.journalSaved = journalSaved;
+      if (journalPath) response.journalPath = journalPath;
+      if (errors.length > 0) {
+        response.apiErrors = errors.map((e) => `${e.code}: ${e.message}`);
+      }
+      return {
+        content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
+      };
+    }
+  );
+}
+
+// src/utils/formatters.ts
 function healthTag(health) {
   switch (health) {
     case "Available":
@@ -26536,485 +26402,29 @@ timeline
   return lines.join("\n");
 }
 
-// src/tools/triage.ts
-import { mkdirSync as mkdirSync3, writeFileSync as writeFileSync3 } from "node:fs";
-import { join as join3 } from "node:path";
-import { homedir as homedir3 } from "node:os";
-var TRIAGE_ALERT_TEMPLATES = {
-  "microsoft.web/sites": [
-    { name: "Error Rate", metric: "Http5xx", threshold: 10, description: "HTTP 5xx > 10 in 5min" },
-    { name: "High CPU", metric: "CpuPercentage", threshold: 85, description: "CPU > 85% for 5min" },
-    { name: "High Memory", metric: "MemoryPercentage", threshold: 85, description: "Memory > 85% for 5min" },
-    { name: "Slow Response", metric: "HttpResponseTime", threshold: 5, description: "Avg response > 5s" }
-  ],
-  "microsoft.sql/servers/databases": [
-    { name: "DTU Saturation", metric: "dtu_consumption_percent", threshold: 90, description: "DTU > 90% for 5min" },
-    { name: "Connection Failures", metric: "connection_failed", threshold: 5, description: "Failed connections > 5 in 5min" },
-    { name: "Deadlocks", metric: "deadlock", threshold: 1, description: "Any deadlock detected" }
-  ],
-  "microsoft.compute/virtualmachines": [
-    { name: "High CPU", metric: "Percentage CPU", threshold: 90, description: "CPU > 90% for 5min" },
-    { name: "Disk I/O", metric: "OS Disk Queue Depth", threshold: 10, description: "Disk queue > 10" }
-  ],
-  "microsoft.cache/redis": [
-    { name: "Server Load", metric: "serverLoad", threshold: 80, description: "Server load > 80%" },
-    { name: "Memory Usage", metric: "usedmemorypercentage", threshold: 85, description: "Memory > 85%" }
-  ]
-};
-var JOURNAL_DIR2 = join3(homedir3(), ".azdoctor", "journal");
-function ensureJournalDir2() {
-  mkdirSync3(JOURNAL_DIR2, { recursive: true });
-}
-function formatDateForFilename(date3) {
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${date3.getFullYear()}-${pad(date3.getMonth() + 1)}-${pad(date3.getDate())}-${pad(date3.getHours())}${pad(date3.getMinutes())}${pad(date3.getSeconds())}`;
-}
-function sanitizeResourceName2(resource) {
-  return resource.replace(/[/\\:*?"<>|]/g, "-").replace(/\s+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "").toLowerCase();
-}
-function computeBaseline(dataPoints, metricName) {
-  const values = [];
-  for (const dp of dataPoints) {
-    const v = dp.average ?? dp.maximum;
-    if (v !== void 0) values.push(v);
-  }
-  if (values.length < 2) return null;
-  const mean = values.reduce((a, b) => a + b, 0) / values.length;
-  const variance = values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / values.length;
-  const stdDev = Math.sqrt(variance);
-  const current = values[values.length - 1];
-  const zScore = stdDev !== 0 ? (current - mean) / stdDev : 0;
-  let status;
-  if (Math.abs(zScore) < 1) {
-    status = "normal";
-  } else if (Math.abs(zScore) < 2) {
-    status = "elevated";
-  } else {
-    status = "anomalous";
-  }
-  return {
-    metric: metricName,
-    current: Math.round(current * 100) / 100,
-    mean: Math.round(mean * 100) / 100,
-    stdDev: Math.round(stdDev * 100) / 100,
-    zScore: Math.round(zScore * 100) / 100,
-    status
-  };
-}
-function buildRemediationSuggestions(insights, currentHealth, dependentResources) {
-  const suggestions = [];
-  for (const insight of insights) {
-    if (insight.recommendation && !suggestions.includes(insight.recommendation)) {
-      suggestions.push(insight.recommendation);
-    }
-  }
-  if (currentHealth === "Unavailable" || currentHealth === "Degraded") {
-    suggestions.push(
-      "Check Azure Service Health for ongoing platform incidents in the resource's region."
-    );
-  }
-  const unhealthyDeps = dependentResources.filter((d) => d.health !== "Available");
-  for (const dep of unhealthyDeps) {
-    suggestions.push(
-      `Investigate dependent resource ${dep.name} (${dep.type}) \u2014 currently ${dep.health}.`
-    );
-  }
-  if (suggestions.length === 0) {
-    suggestions.push(
-      "No clear root cause identified from available signals.",
-      "Search Microsoft Learn docs for troubleshooting guidance specific to this resource type."
-    );
-  }
-  return suggestions;
-}
-function buildJournalMarkdown(report) {
-  const insightsBullets = report.diagnosticInsights.length > 0 ? report.diagnosticInsights.map((i) => `- **${i.pattern}** (${i.confidence}): ${i.description}`).join("\n") : "- No diagnostic patterns detected.";
-  const trendsBullets = report.metricTrends.length > 0 ? report.metricTrends.map((t) => `- ${t.description}`).join("\n") : "- All monitored metrics are stable.";
-  const baselineRows = report.baseline.metrics.length > 0 ? "| Metric | Current | Mean | StdDev | Z-Score | Status |\n|--------|---------|------|--------|---------|--------|\n" + report.baseline.metrics.map(
-    (m) => `| ${m.metric} | ${m.current} | ${m.mean} | ${m.stdDev} | ${m.zScore} | ${m.status} |`
-  ).join("\n") : "No baseline metrics available.";
-  const alertsBullets = report.alertRecommendations.length > 0 ? report.alertRecommendations.map((a) => `- **${a.name}**: ${a.description} (metric: ${a.metric}, threshold: ${a.threshold})`).join("\n") : "- No alert recommendations for this resource type.";
-  return `# Triage Report: ${report.resource}
-**Date:** ${report.timestamp}
-**Type:** ${report.resourceType}
-**Health:** ${report.currentHealth}
-**Confidence:** ${report.confidence}
-
-## Root Cause
-${report.likelyCause}
-
-## Diagnostic Insights
-${insightsBullets}
-
-## Metric Trends
-${trendsBullets}
-
-## Baseline Status
-${baselineRows}
-
-## Topology
-\`\`\`
-${report.topology}
-\`\`\`
-
-## Recommended Alerts
-${alertsBullets}
-
----
-*Auto-saved by AZ Doctor triage*
-`;
-}
-function registerTriage(server2) {
-  server2.tool(
-    "azdoctor_triage",
-    "Run the full diagnostic pipeline on a resource in one command. Chains: permission check \u2192 multi-signal investigation \u2192 baseline comparison \u2192 alert recommendations \u2192 auto-saves to journal. Returns a comprehensive triage report.",
-    {
-      resource: external_exports.string().describe("Resource name or full Azure resource ID"),
-      subscription: external_exports.string().optional().describe("Azure subscription ID (auto-detected if omitted)"),
-      resourceGroup: external_exports.string().optional().describe("Resource group name"),
-      symptom: external_exports.string().optional().describe("User-described symptom"),
-      timeframeHours: external_exports.number().default(24).describe("Investigation lookback window in hours"),
-      baselineDays: external_exports.number().default(7).describe("Baseline comparison lookback in days"),
-      saveToJournal: external_exports.boolean().default(true).describe("Auto-save the triage report to the incident journal"),
-      generateAlerts: external_exports.boolean().default(true).describe("Generate alert rule recommendations")
-    },
-    async ({
-      resource,
-      subscription: subParam,
-      resourceGroup,
-      symptom,
-      timeframeHours,
-      baselineDays,
-      saveToJournal,
-      generateAlerts
-    }) => {
-      const startTime = Date.now();
-      const errors = [];
-      const allEvents = [];
-      const subscription = await resolveSubscription(subParam);
-      let resourceId = resource;
-      let resourceType = "Unknown";
-      let resourceName = resource;
-      let resolvedResourceGroup = resourceGroup;
-      if (!resource.startsWith("/subscriptions/")) {
-        const rgFilter = resourceGroup ? `| where resourceGroup =~ '${resourceGroup}'` : "";
-        const resolveQuery = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup | take 1`;
-        const resolved = await queryResourceGraph([subscription], resolveQuery);
-        if (resolved.resources.length > 0) {
-          const r = resolved.resources[0];
-          resourceId = r.id ?? resource;
-          resourceType = r.type ?? "Unknown";
-          resourceName = r.name ?? resource;
-          resolvedResourceGroup = r.resourceGroup ?? resourceGroup;
-        } else if (resolved.error) {
-          errors.push(resolved.error);
-        }
-      } else {
-        const parts = resource.split("/");
-        resourceName = parts[parts.length - 1] ?? resource;
-        const providerIdx = parts.indexOf("providers");
-        if (providerIdx !== -1 && parts.length > providerIdx + 2) {
-          resourceType = `${parts[providerIdx + 1]}/${parts[providerIdx + 2]}`;
-        }
-        const rgIdx = parts.indexOf("resourceGroups");
-        if (rgIdx !== -1 && parts.length > rgIdx + 1) {
-          resolvedResourceGroup = parts[rgIdx + 1];
-        }
-      }
-      const permissionsCheck = {
-        resourceHealth: false,
-        activityLog: false,
-        metrics: false,
-        logAnalytics: false,
-        summary: ""
-      };
-      const metricConfig = getMetricConfig(resourceType);
-      const [healthResult, activityResult, metricsResult, workspacesResult] = await Promise.all([
-        getResourceHealth(subscription, resourceId),
-        getActivityLogs(subscription, timeframeHours, resourceId),
-        metricConfig ? getMetrics(resourceId, metricConfig.names, timeframeHours) : Promise.resolve({ data: null, error: void 0 }),
-        resolvedResourceGroup ? discoverWorkspaces(subscription, resolvedResourceGroup) : Promise.resolve({ workspaces: [], error: void 0 })
-      ]);
-      permissionsCheck.resourceHealth = !healthResult.error;
-      permissionsCheck.activityLog = !activityResult.error;
-      permissionsCheck.metrics = !metricsResult.error;
-      permissionsCheck.logAnalytics = !workspacesResult.error;
-      let currentHealth = "Unknown";
-      if (healthResult.error) {
-        errors.push(healthResult.error);
-      } else if (healthResult.statuses.length > 0) {
-        const status = healthResult.statuses[0];
-        currentHealth = status.properties?.availabilityState ?? "Unknown";
-        if (currentHealth !== "Available") {
-          allEvents.push({
-            time: (/* @__PURE__ */ new Date()).toISOString(),
-            event: `Health status: ${currentHealth} \u2014 ${status.properties?.summary ?? ""}`,
-            source: "ResourceHealth",
-            resource: resourceName,
-            severity: currentHealth === "Unavailable" ? "critical" : "warning"
-          });
-        }
-      }
-      if (activityResult.error) {
-        errors.push(activityResult.error);
-      } else {
-        for (const event of activityResult.events) {
-          const opName = event.operationName?.localizedValue ?? event.operationName?.value ?? "Unknown operation";
-          const status = event.status?.value ?? "";
-          const timestamp2 = event.eventTimestamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString();
-          allEvents.push({
-            time: timestamp2,
-            event: `${opName} (${status})`,
-            source: "ActivityLog",
-            resource: resourceName,
-            actor: event.caller,
-            severity: status === "Failed" ? "warning" : "info"
-          });
-        }
-      }
-      const metricTrends = [];
-      const metricDataByName = /* @__PURE__ */ new Map();
-      if (metricsResult.error) {
-        errors.push(metricsResult.error);
-      } else if (metricsResult.data && metricConfig) {
-        for (const metric of metricsResult.data.metrics) {
-          for (const ts of metric.timeseries) {
-            if (!ts.data) continue;
-            const dataPoints = ts.data.filter(
-              (dp) => dp.average !== void 0 || dp.maximum !== void 0
-            ).map((dp) => ({
-              timestamp: dp.timeStamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString(),
-              average: dp.average ?? void 0,
-              maximum: dp.maximum ?? void 0
-            }));
-            metricDataByName.set(metric.name, dataPoints);
-            const anomalies = detectMetricAnomalies(
-              resourceId,
-              metric.name,
-              dataPoints,
-              {
-                warningPct: metricConfig.warningPct,
-                criticalPct: metricConfig.criticalPct
-              }
-            );
-            allEvents.push(...anomalies);
-            if (dataPoints.length >= 3) {
-              const trend = detectTrends(dataPoints, metric.name);
-              if (trend.trend !== "stable") {
-                metricTrends.push(trend);
-              }
-            }
-          }
-        }
-      }
-      const dependentResources = [];
-      if (resolvedResourceGroup) {
-        const depQueries = getDependencyQueries(resourceType, resolvedResourceGroup);
-        if (depQueries.length > 0) {
-          const depResults = await Promise.all(
-            depQueries.map((dq) => queryResourceGraph([subscription], dq.query))
-          );
-          const allDeps = [];
-          for (const result of depResults) {
-            for (const dep of result.resources) {
-              allDeps.push({
-                id: dep.id,
-                name: dep.name,
-                type: dep.type
-              });
-            }
-            if (result.error) {
-              errors.push(result.error);
-            }
-          }
-          const uniqueDeps = /* @__PURE__ */ new Map();
-          for (const dep of allDeps) {
-            if (!uniqueDeps.has(dep.id)) {
-              uniqueDeps.set(dep.id, dep);
-            }
-          }
-          const healthChecks = await batchExecute(
-            Array.from(uniqueDeps.values()).map((dep) => async () => {
-              const depHealth = await getResourceHealth(subscription, dep.id);
-              const depState = depHealth.statuses[0]?.properties?.availabilityState ?? "Unknown";
-              return { dep, depState };
-            }),
-            5
-          );
-          for (const { dep, depState } of healthChecks) {
-            dependentResources.push({
-              name: dep.name,
-              type: dep.type,
-              health: depState,
-              concern: depState !== "Available" ? `${dep.name} is ${depState}` : void 0
-            });
-            if (depState !== "Available") {
-              allEvents.push({
-                time: (/* @__PURE__ */ new Date()).toISOString(),
-                event: `Dependent resource ${dep.name} health: ${depState}`,
-                source: "ResourceHealth",
-                resource: dep.name,
-                severity: "warning"
-              });
-            }
-          }
-        }
-      }
-      const correlation = correlateTimelines(allEvents);
-      const diagnosticInsights = detectDiagnosticPatterns(allEvents, resourceType);
-      const baselineMetrics = [];
-      if (metricConfig) {
-        const baselineHours = baselineDays * 24;
-        const baselineResult = await getMetrics(
-          resourceId,
-          metricConfig.names,
-          baselineHours,
-          "PT1H"
-        );
-        if (baselineResult.error) {
-          errors.push(baselineResult.error);
-        } else if (baselineResult.data) {
-          for (const metric of baselineResult.data.metrics) {
-            for (const ts of metric.timeseries) {
-              if (!ts.data) continue;
-              const dataPoints = ts.data.filter(
-                (dp) => dp.average !== void 0 || dp.maximum !== void 0
-              ).map((dp) => ({
-                timestamp: dp.timeStamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString(),
-                average: dp.average ?? void 0,
-                maximum: dp.maximum ?? void 0
-              }));
-              const bl = computeBaseline(dataPoints, metric.name);
-              if (bl) baselineMetrics.push(bl);
-            }
-          }
-        }
-      }
-      const anomalousCount = baselineMetrics.filter((m) => m.status === "anomalous").length;
-      const elevatedCount = baselineMetrics.filter((m) => m.status === "elevated").length;
-      let baselineOverallStatus;
-      if (anomalousCount > 0) {
-        baselineOverallStatus = `${anomalousCount} metric(s) anomalous`;
-      } else if (elevatedCount > 0) {
-        baselineOverallStatus = `${elevatedCount} metric(s) elevated`;
-      } else {
-        baselineOverallStatus = "All metrics within normal range";
-      }
-      const rootNode = {
-        name: resourceName,
-        type: resourceType,
-        health: currentHealth === "Available" ? "Available" : currentHealth === "Degraded" ? "Degraded" : currentHealth === "Unavailable" ? "Unavailable" : "Unknown",
-        isRoot: true
-      };
-      const depNodes = dependentResources.map((d) => ({
-        name: d.name,
-        type: d.type,
-        health: d.health === "Available" ? "Available" : d.health === "Degraded" ? "Degraded" : d.health === "Unavailable" ? "Unavailable" : "Unknown",
-        isRoot: false
-      }));
-      const topologyAscii = renderTopology(rootNode, depNodes);
-      const alertRecommendations = generateAlerts ? TRIAGE_ALERT_TEMPLATES[resourceType.toLowerCase()] ?? [] : [];
-      const remediationSuggestions = buildRemediationSuggestions(
-        diagnosticInsights,
-        currentHealth,
-        dependentResources
-      );
-      const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-      const durationMs = Date.now() - startTime;
-      const triageDuration = `${(durationMs / 1e3).toFixed(1)}s`;
-      const accessibleAPIs = [];
-      const inaccessibleAPIs = [];
-      if (permissionsCheck.resourceHealth) accessibleAPIs.push("Resource Health");
-      else inaccessibleAPIs.push("Resource Health");
-      if (permissionsCheck.activityLog) accessibleAPIs.push("Activity Log");
-      else inaccessibleAPIs.push("Activity Log");
-      if (permissionsCheck.metrics) accessibleAPIs.push("Metrics");
-      else inaccessibleAPIs.push("Metrics");
-      if (permissionsCheck.logAnalytics) accessibleAPIs.push("Log Analytics");
-      else inaccessibleAPIs.push("Log Analytics");
-      permissionsCheck.summary = inaccessibleAPIs.length === 0 ? "All APIs accessible \u2014 full diagnostic data available." : `${accessibleAPIs.length}/4 APIs accessible. Inaccessible: ${inaccessibleAPIs.join(", ")}.`;
-      let journalSaved = false;
-      let journalPath;
-      if (saveToJournal) {
-        try {
-          ensureJournalDir2();
-          const now = /* @__PURE__ */ new Date();
-          const filename = `triage-${sanitizeResourceName2(resourceName)}-${formatDateForFilename(now)}.md`;
-          journalPath = join3(JOURNAL_DIR2, filename);
-          const markdownContent = buildJournalMarkdown({
-            resource: resourceName,
-            resourceType,
-            timestamp,
-            currentHealth,
-            confidence: correlation.confidence,
-            likelyCause: correlation.likelyCause,
-            diagnosticInsights,
-            metricTrends,
-            baseline: {
-              overallStatus: baselineOverallStatus,
-              metrics: baselineMetrics,
-              lookbackDays: baselineDays
-            },
-            topology: topologyAscii,
-            alertRecommendations
-          });
-          writeFileSync3(journalPath, markdownContent, "utf-8");
-          journalSaved = true;
-        } catch {
-          journalSaved = false;
-        }
-      }
-      const errorSummary = formatErrorSummary(errors);
-      const response = {
-        // Header
-        resource: resourceName,
-        resourceType,
-        subscription,
-        timestamp,
-        triageDuration,
-        // Permissions
-        permissions: permissionsCheck,
-        // Investigation
-        currentHealth,
-        confidence: correlation.confidence,
-        cascadingFailure: correlation.cascadingFailure,
-        likelyCause: correlation.likelyCause,
-        timeline: correlation.timeline,
-        diagnosticInsights: diagnosticInsights.length > 0 ? diagnosticInsights : [],
-        metricTrends: metricTrends.length > 0 ? metricTrends : [],
-        // Dependencies
-        topology: topologyAscii,
-        dependentResources: dependentResources.map((d) => ({
-          name: d.name,
-          type: d.type,
-          health: d.health
-        })),
-        // Baseline
-        baseline: {
-          overallStatus: baselineOverallStatus,
-          metrics: baselineMetrics,
-          lookbackDays: baselineDays
-        },
-        // Recommendations
-        alertRecommendations,
-        remediationSuggestions,
-        // Journal
-        journalSaved,
-        journalPath,
-        // Errors
-        diagnosticCoverage: errorSummary.message,
-        errors: errors.length > 0 ? errors : void 0
-      };
-      return {
-        content: [
-          { type: "text", text: JSON.stringify(response, null, 2) }
-        ]
-      };
-    }
-  );
-}
-
 // src/tools/diagram.ts
+var PARENT_METRIC_RESOURCES7 = {
+  "microsoft.web/sites": { property: "properties.serverFarmId", label: "App Service Plan" }
+};
+var MAX_METRICS6 = 15;
+var METRIC_PRIORITY_PATTERNS = [
+  /percent/i,
+  /cpu/i,
+  /memory/i,
+  /error/i,
+  /5xx/i,
+  /4xx/i,
+  /fail/i,
+  /latency/i,
+  /response.*time/i,
+  /request/i,
+  /connection/i,
+  /dtu/i,
+  /throughput/i,
+  /availability/i,
+  /queue/i,
+  /count/i
+];
 function registerDiagram(server2) {
   server2.tool(
     "azdoctor_diagram",
@@ -27039,9 +26449,10 @@ function registerDiagram(server2) {
       let resourceType = "Unknown";
       let resourceName = resource;
       let resolvedResourceGroup = resourceGroup;
+      let resourceProperties = {};
       if (!resource.startsWith("/subscriptions/")) {
         const rgFilter = resourceGroup ? `| where resourceGroup =~ '${resourceGroup}'` : "";
-        const resolveQuery = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup | take 1`;
+        const resolveQuery = `Resources | where name =~ '${resource}' ${rgFilter} | project id, name, type, location, resourceGroup, properties | take 1`;
         const resolved = await queryResourceGraph([subscription], resolveQuery);
         if (resolved.resources.length > 0) {
           const r = resolved.resources[0];
@@ -27049,6 +26460,7 @@ function registerDiagram(server2) {
           resourceType = r.type ?? "Unknown";
           resourceName = r.name ?? resource;
           resolvedResourceGroup = r.resourceGroup ?? resourceGroup;
+          resourceProperties = r.properties ?? {};
         } else if (resolved.error) {
           errors.push(resolved.error);
         }
@@ -27081,29 +26493,101 @@ function registerDiagram(server2) {
         };
         const depNodes = [];
         if (resolvedResourceGroup) {
-          const depQueries = getDependencyQueries(resourceType, resolvedResourceGroup);
-          if (depQueries.length > 0) {
-            const depResults = await Promise.all(
-              depQueries.map((dq) => queryResourceGraph([subscription], dq.query))
-            );
-            const allDeps = /* @__PURE__ */ new Map();
-            for (const result of depResults) {
-              for (const dep of result.resources) {
-                const depId = dep.id;
-                if (!allDeps.has(depId)) {
-                  allDeps.set(depId, {
-                    id: depId,
-                    name: dep.name,
-                    type: dep.type
-                  });
+          const depResourceIds = [];
+          if (resourceType.toLowerCase() === "microsoft.web/sites") {
+            const configQuery = `Resources
+| where type =~ 'microsoft.web/sites' and name =~ '${resourceName}' and resourceGroup =~ '${resolvedResourceGroup}'
+| project siteConfig = properties.siteConfig, serverFarmId = properties.serverFarmId
+| take 1`;
+            const configResult = await queryResourceGraph([subscription], configQuery);
+            const referencedNames = /* @__PURE__ */ new Set();
+            if (configResult.resources.length > 0) {
+              const config2 = configResult.resources[0];
+              const siteConfig = config2["siteConfig"];
+              const appSettings = siteConfig?.["appSettings"];
+              if (Array.isArray(appSettings)) {
+                for (const setting of appSettings) {
+                  const val = String(setting.value ?? "");
+                  const serverMatch = val.match(/(?:Server|Data Source|AccountEndpoint)=(?:tcp:)?([^;,]+)/i);
+                  if (serverMatch) {
+                    const host = serverMatch[1].split(".")[0];
+                    referencedNames.add(host.toLowerCase());
+                  }
+                  const redisMatch = val.match(/([^.]+)\.redis\.cache\.windows\.net/i);
+                  if (redisMatch) referencedNames.add(redisMatch[1].toLowerCase());
+                  const storageMatch = val.match(/([^.]+)\.blob\.core\.windows\.net/i);
+                  if (storageMatch) referencedNames.add(storageMatch[1].toLowerCase());
+                  const cosmosMatch = val.match(/([^.]+)\.documents\.azure\.com/i);
+                  if (cosmosMatch) referencedNames.add(cosmosMatch[1].toLowerCase());
                 }
               }
-              if (result.error) {
-                errors.push(result.error);
+            }
+            if (configResult.error) errors.push(configResult.error);
+            if (referencedNames.size > 0) {
+              const nameFilter = Array.from(referencedNames).map((n) => `name =~ '${n}'`).join(" or ");
+              const refQuery = `Resources | where (${nameFilter}) | project id, name, type | take 20`;
+              const refResult = await queryResourceGraph([subscription], refQuery);
+              if (refResult.error) errors.push(refResult.error);
+              for (const dep of refResult.resources) {
+                depResourceIds.push({
+                  id: dep.id,
+                  name: dep.name,
+                  type: dep.type
+                });
+              }
+              for (const dep of [...depResourceIds]) {
+                if (dep.type.toLowerCase() === "microsoft.sql/servers") {
+                  const dbQuery = `Resources | where type =~ 'microsoft.sql/servers/databases' and name != 'master' and resourceGroup =~ '${resolvedResourceGroup}' and id startswith '${dep.id}' | project id, name, type`;
+                  const dbResult = await queryResourceGraph([subscription], dbQuery);
+                  for (const db of dbResult.resources) {
+                    depResourceIds.push({
+                      id: db.id,
+                      name: db.name,
+                      type: db.type
+                    });
+                  }
+                }
               }
             }
+            if (depResourceIds.length === 0) {
+              const fallbackQuery = `Resources
+| where resourceGroup =~ '${resolvedResourceGroup}'
+| where name != '${resourceName}'
+| where type in~ ('microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.servicebus/namespaces', 'microsoft.eventhub/namespaces')
+| where name != 'master'
+| project id, name, type
+| take 10`;
+              const fallbackResult = await queryResourceGraph([subscription], fallbackQuery);
+              if (fallbackResult.error) errors.push(fallbackResult.error);
+              for (const dep of fallbackResult.resources) {
+                depResourceIds.push({
+                  id: dep.id,
+                  name: dep.name,
+                  type: dep.type
+                });
+              }
+            }
+          } else {
+            const depQuery = `Resources
+| where resourceGroup =~ '${resolvedResourceGroup}'
+| where name != '${resourceName}'
+| where type in~ ('microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.web/sites', 'microsoft.compute/virtualmachines', 'microsoft.containerservice/managedclusters')
+| where name != 'master'
+| project id, name, type
+| take 10`;
+            const depResult = await queryResourceGraph([subscription], depQuery);
+            if (depResult.error) errors.push(depResult.error);
+            for (const dep of depResult.resources) {
+              depResourceIds.push({
+                id: dep.id,
+                name: dep.name,
+                type: dep.type
+              });
+            }
+          }
+          if (depResourceIds.length > 0) {
             const healthChecks = await batchExecute(
-              Array.from(allDeps.values()).map((dep) => async () => {
+              depResourceIds.map((dep) => async () => {
                 const depHealth = await getResourceHealth(subscription, dep.id);
                 const depState = depHealth.statuses[0]?.properties?.availabilityState ?? "Unknown";
                 return { dep, depState };
@@ -27128,11 +26612,60 @@ function registerDiagram(server2) {
       let eventCount = 0;
       if (diagramType === "timeline" || diagramType === "both") {
         const allEvents = [];
-        const metricConfig = getMetricConfig(resourceType);
-        const [healthResult, activityResult, metricsResult] = await Promise.all([
+        const metricDefs = await listMetricDefinitions(resourceId);
+        if (metricDefs.error) errors.push(metricDefs.error);
+        const sortedDefs = [...metricDefs.definitions].sort((a, b) => {
+          const aScore = METRIC_PRIORITY_PATTERNS.findIndex((p) => p.test(a.name));
+          const bScore = METRIC_PRIORITY_PATTERNS.findIndex((p) => p.test(b.name));
+          return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+        });
+        const selectedMetrics = sortedDefs.slice(0, MAX_METRICS6).map((d) => d.name);
+        const parentConfig = PARENT_METRIC_RESOURCES7[resourceType.toLowerCase()];
+        let parentResourceId = null;
+        let parentLabel = null;
+        let parentMetricNames = [];
+        if (parentConfig) {
+          const propPath = parentConfig.property.replace("properties.", "");
+          const parentId = resourceProperties[propPath];
+          if (parentId) {
+            parentResourceId = parentId;
+            parentLabel = parentConfig.label;
+          } else {
+            const parentQuery = `Resources | where type =~ '${resourceType}' and name =~ '${resourceName}' | project parentId = ${parentConfig.property} | take 1`;
+            const parentResult = await queryResourceGraph([subscription], parentQuery);
+            if (parentResult.resources.length > 0) {
+              parentResourceId = parentResult.resources[0]["parentId"] ?? null;
+              parentLabel = parentConfig.label;
+            }
+          }
+          if (parentResourceId) {
+            const parentDefs = await listMetricDefinitions(parentResourceId);
+            if (parentDefs.error) errors.push(parentDefs.error);
+            const parentSorted = [...parentDefs.definitions].sort((a, b) => {
+              const aScore = METRIC_PRIORITY_PATTERNS.findIndex((p) => p.test(a.name));
+              const bScore = METRIC_PRIORITY_PATTERNS.findIndex((p) => p.test(b.name));
+              return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+            });
+            parentMetricNames = parentSorted.slice(0, MAX_METRICS6).map((d) => d.name);
+          }
+        }
+        const metricPromises = [];
+        if (selectedMetrics.length > 0) {
+          metricPromises.push({
+            label: resourceName,
+            promise: getMetrics(resourceId, selectedMetrics, timeframeHours, "PT5M")
+          });
+        }
+        if (parentResourceId && parentMetricNames.length > 0) {
+          metricPromises.push({
+            label: parentLabel ?? "parent",
+            promise: getMetrics(parentResourceId, parentMetricNames, timeframeHours, "PT5M")
+          });
+        }
+        const [healthResult, activityResult, ...metricResults] = await Promise.all([
           getResourceHealth(subscription, resourceId),
           getActivityLogs(subscription, timeframeHours, resourceId),
-          metricConfig ? getMetrics(resourceId, metricConfig.names, timeframeHours) : Promise.resolve({ data: null, error: void 0 })
+          ...metricPromises.map((m) => m.promise)
         ]);
         if (healthResult.error) {
           errors.push(healthResult.error);
@@ -27144,7 +26677,6 @@ function registerDiagram(server2) {
               time: (/* @__PURE__ */ new Date()).toISOString(),
               event: `Health status: ${currentHealth}`,
               source: "ResourceHealth",
-              resource: resourceName,
               severity: currentHealth === "Unavailable" ? "critical" : "warning"
             });
           }
@@ -27160,40 +26692,59 @@ function registerDiagram(server2) {
               time: timestamp,
               event: `${opName} (${status})`,
               source: "ActivityLog",
-              resource: resourceName,
-              actor: event.caller,
               severity: status === "Failed" ? "warning" : "info"
             });
           }
         }
-        if (metricsResult.error) {
-          errors.push(metricsResult.error);
-        } else if (metricsResult.data && metricConfig) {
-          for (const metric of metricsResult.data.metrics) {
+        for (let i = 0; i < metricResults.length; i++) {
+          const result = metricResults[i];
+          const meta = metricPromises[i];
+          if (result.error) {
+            errors.push(result.error);
+            continue;
+          }
+          if (!result.data) continue;
+          for (const metric of result.data.metrics) {
             for (const ts of metric.timeseries) {
               if (!ts.data) continue;
               const dataPoints = ts.data.filter((dp) => dp.average !== void 0 || dp.maximum !== void 0).map((dp) => ({
                 timestamp: dp.timeStamp?.toISOString() ?? (/* @__PURE__ */ new Date()).toISOString(),
-                average: dp.average ?? void 0,
-                maximum: dp.maximum ?? void 0
+                value: dp.average ?? dp.maximum ?? 0
               }));
-              const anomalies = detectMetricAnomalies(
-                resourceId,
-                metric.name,
-                dataPoints,
-                {
-                  warningPct: metricConfig.warningPct,
-                  criticalPct: metricConfig.criticalPct
-                }
+              if (dataPoints.length < 3) continue;
+              const values = dataPoints.map((p) => p.value);
+              const mean = values.reduce((a, b) => a + b, 0) / values.length;
+              const stdDev = Math.sqrt(
+                values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / values.length
               );
-              allEvents.push(...anomalies);
+              const warningThreshold = mean + 2 * stdDev;
+              const criticalThreshold = mean + 3 * stdDev;
+              const isPercentage = /percent/i.test(metric.name) || metric.unit === "Percent";
+              for (const dp of dataPoints) {
+                let severity = null;
+                if (isPercentage) {
+                  if (dp.value >= 95) severity = "critical";
+                  else if (dp.value >= 90) severity = "warning";
+                } else if (stdDev > 0) {
+                  if (dp.value >= criticalThreshold) severity = "critical";
+                  else if (dp.value >= warningThreshold) severity = "warning";
+                }
+                if (severity) {
+                  allEvents.push({
+                    time: dp.timestamp,
+                    event: `${metric.name} spike: ${Math.round(dp.value * 100) / 100} (${meta?.label ?? "unknown"})`,
+                    source: "MetricAnomaly",
+                    severity
+                  });
+                }
+              }
             }
           }
         }
-        const correlation = correlateTimelines(allEvents);
-        eventCount = correlation.timeline.length;
+        allEvents.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+        eventCount = allEvents.length;
         timelineMermaid = renderMermaidTimeline(
-          correlation.timeline.map((e) => ({
+          allEvents.map((e) => ({
             time: e.time,
             event: e.event,
             source: e.source,

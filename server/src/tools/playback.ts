@@ -6,22 +6,27 @@ import {
   getResourceHealth,
   getActivityLogs,
   getMetrics,
+  listMetricDefinitions,
 } from "../utils/azure-client.js";
 import type { AzureError } from "../utils/azure-client.js";
-import {
-  correlateTimelines,
-  detectMetricAnomalies,
-} from "../utils/correlator.js";
-import type { DiagnosticEvent } from "../utils/correlator.js";
-import { getMetricConfig } from "../utils/metric-config.js";
 
-interface PlaybackEntry {
+// Resources where key metrics live on a parent resource, not the resource itself.
+const PARENT_METRIC_RESOURCES: Record<string, { property: string; label: string }> = {
+  "microsoft.web/sites": { property: "properties.serverFarmId", label: "App Service Plan" },
+};
+
+// Max metrics to pull per resource to keep the response manageable
+const MAX_METRICS = 15;
+
+interface TimelineEvent {
   timestamp: string;
+  type: "activity" | "metric" | "health";
   event: string;
   source: string;
   actor?: string;
-  severity?: string;
-  context?: string;
+  severity?: "info" | "warning" | "critical";
+  metricValue?: number;
+  metricUnit?: string;
   phaseMarker?: "pre-incident" | "incident-start" | "during-incident" | "resolution" | "post-incident";
 }
 
@@ -34,55 +39,116 @@ export function registerPlayback(server: McpServer): void {
       subscription: z.string().optional(),
       startTime: z.string().describe("ISO timestamp for playback start"),
       endTime: z.string().optional().describe("ISO timestamp for playback end (defaults to now)"),
-      includeContext: z.boolean().default(true).describe("Include explanatory context for each event"),
     },
-    async ({ resource, subscription: subParam, startTime, endTime, includeContext }) => {
+    async ({ resource, subscription: subParam, startTime, endTime }) => {
       const subscription = await resolveSubscription(subParam);
       const errors: AzureError[] = [];
-      const allEvents: DiagnosticEvent[] = [];
 
-      // 1. Resolve resource
+      // ── 1. Resolve resource (same Resource Graph pattern as investigate) ──
       let resourceId = resource;
-      let resourceType = "Unknown";
+      let resourceType = "unknown";
       let resourceName = resource;
+      let resourceProperties: Record<string, unknown> = {};
 
       if (!resource.startsWith("/subscriptions/")) {
-        const resolveQuery = `Resources | where name =~ '${resource}' | project id, name, type, location, resourceGroup | take 1`;
-        const resolved = await queryResourceGraph([subscription], resolveQuery);
-        if (resolved.resources.length > 0) {
-          const r = resolved.resources[0];
-          resourceId = (r.id as string) ?? resource;
-          resourceType = (r.type as string) ?? "Unknown";
+        const q = `Resources | where name =~ '${resource}' | project id, name, type, location, resourceGroup, properties | take 1`;
+        const result = await queryResourceGraph([subscription], q);
+        if (result.resources.length > 0) {
+          const r = result.resources[0];
+          resourceId = r.id as string;
+          resourceType = (r.type as string) ?? "unknown";
           resourceName = (r.name as string) ?? resource;
-        } else if (resolved.error) {
-          errors.push(resolved.error);
+          resourceProperties = (r.properties as Record<string, unknown>) ?? {};
+        } else if (result.error) {
+          errors.push(result.error);
         }
       } else {
         const parts = resource.split("/");
         resourceName = parts[parts.length - 1] ?? resource;
-        const providerIdx = parts.indexOf("providers");
-        if (providerIdx !== -1 && parts.length > providerIdx + 2) {
-          resourceType = `${parts[providerIdx + 1]}/${parts[providerIdx + 2]}`;
-        }
+        const pi = parts.indexOf("providers");
+        if (pi !== -1 && parts.length > pi + 2) resourceType = `${parts[pi + 1]}/${parts[pi + 2]}`;
       }
 
-      // 2. Calculate hours back from startTime
+      // ── 2. Calculate time window ──────────────────────────────────────────
       const startDate = new Date(startTime);
       const endDate = endTime ? new Date(endTime) : new Date();
       const hoursBack = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (60 * 60 * 1000)));
 
-      // 3. Gather signals in parallel
-      const metricConfig = getMetricConfig(resourceType);
+      // ── 3. Discover available metrics dynamically ─────────────────────────
+      const metricDefs = await listMetricDefinitions(resourceId);
+      if (metricDefs.error) errors.push(metricDefs.error);
 
-      const [healthResult, activityResult, metricsResult] = await Promise.all([
+      const priorityPatterns = [/percent/i, /cpu/i, /memory/i, /error/i, /5xx/i, /4xx/i, /fail/i, /latency/i, /response.*time/i, /request/i, /connection/i, /dtu/i, /throughput/i, /availability/i, /queue/i, /count/i];
+      const sortedDefs = [...metricDefs.definitions].sort((a, b) => {
+        const aScore = priorityPatterns.findIndex((p) => p.test(a.name));
+        const bScore = priorityPatterns.findIndex((p) => p.test(b.name));
+        return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+      });
+      const selectedMetrics = sortedDefs.slice(0, MAX_METRICS).map((d) => d.name);
+
+      // ── 4. For App Services, resolve parent (App Service Plan) for CPU/Memory ─
+      const parentConfig = PARENT_METRIC_RESOURCES[resourceType.toLowerCase()];
+      let parentResourceId: string | null = null;
+      let parentLabel: string | null = null;
+
+      if (parentConfig) {
+        const propPath = parentConfig.property.replace("properties.", "");
+        const parentId = resourceProperties[propPath] as string | undefined;
+        if (parentId) {
+          parentResourceId = parentId;
+          parentLabel = parentConfig.label;
+        } else {
+          const parentQuery = `Resources | where type =~ '${resourceType}' and name =~ '${resourceName}' | project parentId = ${parentConfig.property} | take 1`;
+          const parentResult = await queryResourceGraph([subscription], parentQuery);
+          if (parentResult.resources.length > 0) {
+            parentResourceId = parentResult.resources[0]["parentId"] as string ?? null;
+            parentLabel = parentConfig.label;
+          }
+        }
+      }
+
+      let parentMetricNames: string[] = [];
+      if (parentResourceId) {
+        const parentDefs = await listMetricDefinitions(parentResourceId);
+        if (parentDefs.error) errors.push(parentDefs.error);
+        const parentSorted = [...parentDefs.definitions].sort((a, b) => {
+          const aScore = priorityPatterns.findIndex((p) => p.test(a.name));
+          const bScore = priorityPatterns.findIndex((p) => p.test(b.name));
+          return (aScore === -1 ? 999 : aScore) - (bScore === -1 ? 999 : bScore);
+        });
+        parentMetricNames = parentSorted.slice(0, MAX_METRICS).map((d) => d.name);
+      }
+
+      // ── 5. Gather all signals in parallel ─────────────────────────────────
+      interface MetricFetch { label: string; resourceId: string; promise: ReturnType<typeof getMetrics> }
+      const metricPromises: MetricFetch[] = [];
+
+      if (selectedMetrics.length > 0) {
+        metricPromises.push({
+          label: resourceName,
+          resourceId,
+          promise: getMetrics(resourceId, selectedMetrics, hoursBack, "PT5M"),
+        });
+      }
+
+      if (parentResourceId && parentMetricNames.length > 0) {
+        metricPromises.push({
+          label: parentLabel ?? "parent",
+          resourceId: parentResourceId,
+          promise: getMetrics(parentResourceId, parentMetricNames, hoursBack, "PT5M"),
+        });
+      }
+
+      const [healthResult, activityResult, ...metricResults] = await Promise.all([
         getResourceHealth(subscription, resourceId),
         getActivityLogs(subscription, hoursBack, resourceId),
-        metricConfig
-          ? getMetrics(resourceId, metricConfig.names, hoursBack)
-          : Promise.resolve({ data: null, error: undefined }),
+        ...metricPromises.map((m) => m.promise),
       ]);
 
-      // Process health result
+      // ── 6. Build raw timeline events ──────────────────────────────────────
+      const allEvents: TimelineEvent[] = [];
+
+      // Health events
       if (healthResult.error) {
         errors.push(healthResult.error);
       } else if (healthResult.statuses.length > 0) {
@@ -90,16 +156,16 @@ export function registerPlayback(server: McpServer): void {
         const availState = status.properties?.availabilityState ?? "Unknown";
         if (availState !== "Available") {
           allEvents.push({
-            time: new Date().toISOString(),
+            timestamp: new Date().toISOString(),
+            type: "health",
             event: `Health status: ${availState} — ${status.properties?.summary ?? ""}`,
             source: "ResourceHealth",
-            resource: resourceName,
             severity: availState === "Unavailable" ? "critical" : "warning",
           });
         }
       }
 
-      // Process activity log
+      // Activity log events
       if (activityResult.error) {
         errors.push(activityResult.error);
       } else {
@@ -109,121 +175,132 @@ export function registerPlayback(server: McpServer): void {
             event.operationName?.value ??
             "Unknown operation";
           const status = event.status?.value ?? "";
+          const op = event.operationName?.value ?? "";
           const timestamp = event.eventTimestamp?.toISOString() ?? new Date().toISOString();
 
-          allEvents.push({
-            time: timestamp,
-            event: `${opName} (${status})`,
-            source: "ActivityLog",
-            resource: resourceName,
-            actor: event.caller,
-            severity: status === "Failed" ? "warning" : "info",
-          });
-        }
-      }
+          // Include notable events: config changes, deployments, restarts, failures
+          const isNotable =
+            status === "Failed" ||
+            op.includes("write") ||
+            op.includes("deploy") ||
+            op.includes("restart") ||
+            op.includes("delete") ||
+            op.includes("action") ||
+            op.includes("start") ||
+            op.includes("stop");
 
-      // Process metrics
-      if (metricsResult.error) {
-        errors.push(metricsResult.error);
-      } else if (metricsResult.data && metricConfig) {
-        for (const metric of metricsResult.data.metrics) {
-          for (const ts of metric.timeseries) {
-            if (!ts.data) continue;
-            const dataPoints = ts.data
-              .filter((dp) => dp.average !== undefined || dp.maximum !== undefined)
-              .map((dp) => ({
-                timestamp:
-                  (dp as unknown as { timeStamp: Date }).timeStamp?.toISOString() ??
-                  new Date().toISOString(),
-                average: dp.average ?? undefined,
-                maximum: dp.maximum ?? undefined,
-              }));
-            const anomalies = detectMetricAnomalies(
-              resourceId,
-              metric.name,
-              dataPoints,
-              {
-                warningPct: metricConfig.warningPct,
-                criticalPct: metricConfig.criticalPct,
-              }
-            );
-            allEvents.push(...anomalies);
+          if (isNotable) {
+            allEvents.push({
+              timestamp,
+              type: "activity",
+              event: `${opName} (${status})`,
+              source: "ActivityLog",
+              actor: event.caller,
+              severity: status === "Failed" ? "warning" : "info",
+            });
           }
         }
       }
 
-      // 4. Correlate timelines
-      const correlation = correlateTimelines(allEvents);
+      // Metric data points
+      for (let i = 0; i < metricResults.length; i++) {
+        const result = metricResults[i];
+        const meta = metricPromises[i];
+        if (result.error) { errors.push(result.error); continue; }
+        if (!result.data) continue;
 
-      // Filter events to the playback window
-      const windowEvents = correlation.timeline.filter((e) => {
-        const t = new Date(e.time).getTime();
-        return t >= startDate.getTime() && t <= endDate.getTime();
-      });
+        for (const metric of result.data.metrics) {
+          const defUnit = metricDefs.definitions.find((d) => d.name === metric.name)?.unit ?? metric.unit ?? "Unspecified";
 
-      // 5. Assign phase markers and generate context
-      const anomalyEvents = windowEvents.filter(
-        (e) => e.source === "ResourceHealth" || e.source === "Metrics" || e.source === "ServiceHealth"
-      );
-      const firstAnomalyTime = anomalyEvents.length > 0
-        ? new Date(anomalyEvents[0].time).getTime()
-        : null;
-      const lastAnomalyTime = anomalyEvents.length > 0
-        ? new Date(anomalyEvents[anomalyEvents.length - 1].time).getTime()
-        : null;
+          for (const ts of metric.timeseries) {
+            if (!ts.data) continue;
+            for (const dp of ts.data) {
+              const value = dp.average ?? dp.maximum ?? dp.total;
+              if (value === undefined) continue;
+              const pointTime =
+                (dp as unknown as { timeStamp: Date }).timeStamp?.toISOString() ??
+                new Date().toISOString();
 
-      // Find resolution: first change event after the last anomaly
-      let resolutionTime: number | null = null;
-      if (lastAnomalyTime !== null) {
-        const postAnomalyChanges = windowEvents.filter((e) => {
-          const t = new Date(e.time).getTime();
-          return t > lastAnomalyTime && e.source === "ActivityLog";
-        });
-        if (postAnomalyChanges.length > 0) {
-          resolutionTime = new Date(postAnomalyChanges[0].time).getTime();
+              allEvents.push({
+                timestamp: pointTime,
+                type: "metric",
+                event: `${metric.name}: ${Math.round(value * 100) / 100} ${defUnit}`,
+                source: `Metrics (${meta?.label ?? "unknown"})`,
+                metricValue: Math.round(value * 100) / 100,
+                metricUnit: defUnit,
+              });
+            }
+          }
         }
       }
 
-      const timeline: PlaybackEntry[] = windowEvents.map((e) => {
-        const t = new Date(e.time).getTime();
-        let phaseMarker: PlaybackEntry["phaseMarker"];
-
-        if (firstAnomalyTime === null) {
-          phaseMarker = "pre-incident";
-        } else if (t < firstAnomalyTime) {
-          phaseMarker = "pre-incident";
-        } else if (t === firstAnomalyTime && anomalyEvents[0] === e) {
-          phaseMarker = "incident-start";
-        } else if (lastAnomalyTime !== null && t <= lastAnomalyTime) {
-          phaseMarker = "during-incident";
-        } else if (resolutionTime !== null && t <= resolutionTime && e.source === "ActivityLog") {
-          phaseMarker = "resolution";
-        } else if (lastAnomalyTime !== null && t > lastAnomalyTime) {
-          phaseMarker = "post-incident";
-        } else {
-          phaseMarker = "during-incident";
-        }
-
-        const entry: PlaybackEntry = {
-          timestamp: e.time,
-          event: e.event,
-          source: e.source,
-          actor: e.actor,
-          severity: e.severity,
-          phaseMarker,
-        };
-
-        if (includeContext) {
-          entry.context = generateContext(e);
-        }
-
-        return entry;
+      // ── 7. Filter to playback window and sort chronologically ─────────────
+      const windowEvents = allEvents.filter((e) => {
+        const t = new Date(e.timestamp).getTime();
+        return t >= startDate.getTime() && t <= endDate.getTime();
       });
 
-      // Count phases
-      const preIncidentCount = timeline.filter((e) => e.phaseMarker === "pre-incident").length;
-      const duringIncidentCount = timeline.filter((e) => e.phaseMarker === "during-incident").length;
-      const postIncidentCount = timeline.filter((e) => e.phaseMarker === "post-incident").length;
+      windowEvents.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+      // ── 8. Assign phase markers based on the data ─────────────────────────
+      // Identify anomaly events: health issues, failed operations, elevated metrics
+      const anomalyEvents = windowEvents.filter(
+        (e) =>
+          e.type === "health" ||
+          (e.type === "activity" && e.severity === "warning") ||
+          e.severity === "critical"
+      );
+
+      const firstAnomalyTime = anomalyEvents.length > 0
+        ? new Date(anomalyEvents[0].timestamp).getTime()
+        : null;
+      const lastAnomalyTime = anomalyEvents.length > 0
+        ? new Date(anomalyEvents[anomalyEvents.length - 1].timestamp).getTime()
+        : null;
+
+      // Resolution: first activity event after the last anomaly
+      let resolutionTime: number | null = null;
+      if (lastAnomalyTime !== null) {
+        const postAnomalyChanges = windowEvents.filter((e) => {
+          const t = new Date(e.timestamp).getTime();
+          return t > lastAnomalyTime && e.type === "activity" && e.severity !== "warning";
+        });
+        if (postAnomalyChanges.length > 0) {
+          resolutionTime = new Date(postAnomalyChanges[0].timestamp).getTime();
+        }
+      }
+
+      for (const e of windowEvents) {
+        const t = new Date(e.timestamp).getTime();
+
+        if (firstAnomalyTime === null) {
+          e.phaseMarker = "pre-incident";
+        } else if (t < firstAnomalyTime) {
+          e.phaseMarker = "pre-incident";
+        } else if (t === firstAnomalyTime && e === anomalyEvents[0]) {
+          e.phaseMarker = "incident-start";
+        } else if (lastAnomalyTime !== null && t <= lastAnomalyTime) {
+          e.phaseMarker = "during-incident";
+        } else if (resolutionTime !== null && t <= resolutionTime && e.type === "activity") {
+          e.phaseMarker = "resolution";
+        } else if (lastAnomalyTime !== null && t > lastAnomalyTime) {
+          e.phaseMarker = "post-incident";
+        } else {
+          e.phaseMarker = "during-incident";
+        }
+      }
+
+      // ── 9. Build response ─────────────────────────────────────────────────
+      const durationMs = endDate.getTime() - startDate.getTime();
+      const durationHours = Math.floor(durationMs / (60 * 60 * 1000));
+      const durationMinutes = Math.floor((durationMs % (60 * 60 * 1000)) / (60 * 1000));
+      const durationStr = durationHours > 0
+        ? `${durationHours}h ${durationMinutes}m`
+        : `${durationMinutes}m`;
+
+      const preIncidentCount = windowEvents.filter((e) => e.phaseMarker === "pre-incident").length;
+      const duringIncidentCount = windowEvents.filter((e) => e.phaseMarker === "during-incident").length;
+      const postIncidentCount = windowEvents.filter((e) => e.phaseMarker === "post-incident").length;
 
       const incidentStartTimestamp = firstAnomalyTime
         ? new Date(firstAnomalyTime).toISOString()
@@ -232,32 +309,14 @@ export function registerPlayback(server: McpServer): void {
         ? new Date(resolutionTime).toISOString()
         : null;
 
-      // Build summary
-      const durationMs = endDate.getTime() - startDate.getTime();
-      const durationHours = Math.floor(durationMs / (60 * 60 * 1000));
-      const durationMinutes = Math.floor((durationMs % (60 * 60 * 1000)) / (60 * 1000));
-      const durationStr = durationHours > 0
-        ? `${durationHours}h ${durationMinutes}m`
-        : `${durationMinutes}m`;
-
-      let summary = `${timeline.length} events over ${durationStr}.`;
-      if (incidentStartTimestamp) {
-        const startUtc = incidentStartTimestamp.replace("T", " ").replace(/\.\d+Z$/, " UTC");
-        summary += ` Incident started at ${startUtc}`;
-        if (resolutionTimestamp) {
-          const resolveUtc = resolutionTimestamp.replace("T", " ").replace(/\.\d+Z$/, " UTC");
-          summary += `, resolved at ${resolveUtc}.`;
-        } else {
-          summary += `, no clear resolution detected.`;
-        }
-      } else {
-        summary += " No anomalies detected in the playback window.";
-      }
-
       const response = {
         resource: resourceName,
+        resourceType,
         playbackWindow: `${startDate.toISOString()} to ${endDate.toISOString()}`,
-        totalEvents: timeline.length,
+        duration: durationStr,
+        totalEvents: windowEvents.length,
+        metricsDiscovered: selectedMetrics.length + parentMetricNames.length,
+        parentResource: parentResourceId ? { id: parentResourceId, label: parentLabel } : undefined,
         phases: {
           preIncident: preIncidentCount,
           incidentStart: incidentStartTimestamp,
@@ -265,8 +324,7 @@ export function registerPlayback(server: McpServer): void {
           resolution: resolutionTimestamp,
           postIncident: postIncidentCount,
         },
-        timeline,
-        summary,
+        timeline: windowEvents,
         errors: errors.length > 0 ? errors : undefined,
       };
 
@@ -277,47 +335,4 @@ export function registerPlayback(server: McpServer): void {
       };
     }
   );
-}
-
-function generateContext(event: DiagnosticEvent): string {
-  const e = event.event.toLowerCase();
-
-  if (event.source === "ActivityLog") {
-    if (e.includes("write")) {
-      return "A configuration change was made to the resource.";
-    }
-    if (e.includes("delete")) {
-      return "A resource or component was deleted.";
-    }
-    if (e.includes("failed")) {
-      return "This operation failed — check if it's related to the incident.";
-    }
-    return "An activity log event was recorded.";
-  }
-
-  if (event.source === "ResourceHealth") {
-    if (e.includes("unavailable")) {
-      return "Azure detected the resource as unavailable. This typically means the resource cannot serve requests.";
-    }
-    if (e.includes("degraded")) {
-      return "The resource is experiencing reduced functionality or performance.";
-    }
-    return "A resource health status change was detected.";
-  }
-
-  if (event.source === "Metrics") {
-    if (event.severity === "critical") {
-      return "This metric exceeded the critical threshold, indicating severe resource pressure.";
-    }
-    if (event.severity === "warning") {
-      return "This metric is elevated and approaching critical levels.";
-    }
-    return "A metric anomaly was detected.";
-  }
-
-  if (event.source === "ServiceHealth") {
-    return "An Azure platform event was reported that may affect this resource.";
-  }
-
-  return "An event was recorded.";
 }
