@@ -2,3 +2,4 @@ node_modules/
 server/*.tsbuildinfo
 .env
 *.log
+demo/DEMO-WALKTHROUGH.md
