@@ -31,11 +31,21 @@ export function registerInvestigate(server: McpServer): void {
       subscription: z.string().optional().describe("Azure subscription ID (auto-detected from az CLI if omitted)"),
       resourceGroup: z.string().optional().describe("Resource group name (helps resolve resource ID faster)"),
       timeframeHours: z.number().default(24).describe("How many hours back to investigate"),
+      startTime: z.string().optional().describe("ISO timestamp for incident start (e.g., 2026-03-25T14:00:00Z). Overrides timeframeHours."),
+      endTime: z.string().optional().describe("ISO timestamp for incident end. Defaults to now if startTime is provided."),
       symptom: z.string().optional().describe('User-described symptom (e.g., "slow", "500 errors", "unreachable")'),
     },
-    async ({ resource, subscription: subParam, resourceGroup, timeframeHours, symptom }) => {
+    async ({ resource, subscription: subParam, resourceGroup, timeframeHours, startTime, endTime, symptom }) => {
       const subscription = await resolveSubscription(subParam);
       const errors: AzureError[] = [];
+
+      // Compute effective time window
+      let effectiveHours = timeframeHours;
+      if (startTime) {
+        const start = new Date(startTime);
+        const end = endTime ? new Date(endTime) : new Date();
+        effectiveHours = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / (60 * 60 * 1000)));
+      }
 
       // ── 1. Resolve resource ──────────────────────────────────────────
       let resourceId = resource;
@@ -126,7 +136,7 @@ export function registerInvestigate(server: McpServer): void {
         metricPromises.push({
           label: resourceName,
           resourceId,
-          promise: getMetrics(resourceId, selectedMetrics, timeframeHours, "PT5M"),
+          promise: getMetrics(resourceId, selectedMetrics, effectiveHours, "PT5M"),
         });
       }
 
@@ -134,13 +144,13 @@ export function registerInvestigate(server: McpServer): void {
         metricPromises.push({
           label: `${parentLabel ?? "parent"}`,
           resourceId: parentResourceId,
-          promise: getMetrics(parentResourceId, parentMetricNames, timeframeHours, "PT5M"),
+          promise: getMetrics(parentResourceId, parentMetricNames, effectiveHours, "PT5M"),
         });
       }
 
       const [healthResult, activityResult, ...metricResults] = await Promise.all([
         getResourceHealth(subscription, resourceId),
-        getActivityLogs(subscription, timeframeHours, resourceId),
+        getActivityLogs(subscription, effectiveHours, resourceId),
         ...metricPromises.map((m) => m.promise),
       ]);
 
@@ -383,22 +393,22 @@ export function registerInvestigate(server: McpServer): void {
 
           const [reqResult, excResult, depFail] = await Promise.all([
             queryLogAnalytics(ws.workspaceId, `AppRequests
-| where TimeGenerated > ago(${timeframeHours}h)
+| where TimeGenerated > ago(${effectiveHours}h)
 | where Success == false
 | summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by OperationName, ResultCode
 | order by Count desc
-| take 10`, timeframeHours),
+| take 10`, effectiveHours),
             queryLogAnalytics(ws.workspaceId, `AppExceptions
-| where TimeGenerated > ago(${timeframeHours}h)
+| where TimeGenerated > ago(${effectiveHours}h)
 | summarize Count = count() by ExceptionType, OuterMessage
 | order by Count desc
-| take 10`, timeframeHours),
+| take 10`, effectiveHours),
             queryLogAnalytics(ws.workspaceId, `AppDependencies
-| where TimeGenerated > ago(${timeframeHours}h)
+| where TimeGenerated > ago(${effectiveHours}h)
 | where Success == false
 | summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by Target, DependencyType = Type, ResultCode
 | order by Count desc
-| take 10`, timeframeHours),
+| take 10`, effectiveHours),
           ]);
 
           if (reqResult.error) errors.push(reqResult.error);
@@ -430,6 +440,9 @@ export function registerInvestigate(server: McpServer): void {
         resourceType,
         resourceGroup: resolvedRG,
         currentHealth,
+        investigationWindow: startTime
+          ? { start: startTime, end: endTime ?? new Date().toISOString(), hours: effectiveHours }
+          : { hours: effectiveHours },
       };
 
       if (healthDetails) response.healthDetails = healthDetails;
@@ -441,7 +454,7 @@ export function registerInvestigate(server: McpServer): void {
       } else if (selectedMetrics.length === 0 && metricDefs.definitions.length === 0) {
         response.metrics = "This resource type does not emit Azure Monitor metrics.";
       } else {
-        response.metrics = `Metrics requested (${selectedMetrics.join(", ")}) but no data returned for the ${timeframeHours}h window.`;
+        response.metrics = `Metrics requested (${selectedMetrics.join(", ")}) but no data returned for the ${effectiveHours}h window.`;
       }
 
       // Available metrics not pulled (for context)
