@@ -62,13 +62,13 @@ npm install --omit=dev
     "azdoctor": {
       "type": "stdio",
       "command": "node",
-      "args": ["~/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor/server/build/index.js"]
+      "args": ["/Users/YOUR_USERNAME/.copilot/installed-plugins/_direct/ACES-AI-Garage--azdoctor/server/build/index.js"]
     }
   }
 }
 ```
 
-> Replace `YOUR_USERNAME` with your actual username on Windows.
+> Replace `YOUR_USERNAME` with your actual username. If you already have an `mcp-config.json` with other servers, add the `azdoctor` entry inside the existing `mcpServers` object — don't replace the whole file.
 
 **Step 4:** Restart Copilot CLI and verify:
 
