@@ -2,7 +2,7 @@
 
 **AI-powered Azure diagnostics for any MCP client.**
 
-Azure MCP Server gives you the stethoscope — raw signals from health APIs, activity logs, and metrics. Microsoft Learn MCP Server gives you the medical textbook — troubleshooting guides and documentation. AZ Doctor gives you the doctor — diagnostic reasoning that correlates signals across sources, identifies root causes, and produces the structured output engineers actually need.
+Azure MCP Server gives you the stethoscope — raw signals from health APIs, activity logs, and metrics. AZ Doctor gives you the doctor — it knows what telemetry to pull for any Azure resource type, compiles diagnostic data from multiple sources in a single call, and gives the AI model everything it needs to reason about root causes. When paired with the Microsoft Learn MCP Server, the AI can also pull troubleshooting docs to enrich its diagnosis.
 
 ## What It Does
 
