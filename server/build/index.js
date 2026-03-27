@@ -21089,6 +21089,10 @@ async function createMetricsQueryClient() {
   const { MetricsQueryClient } = await import("@azure/monitor-query");
   return new MetricsQueryClient(await getCredential());
 }
+async function createComputeClient(subscriptionId) {
+  const { ComputeManagementClient } = await import("@azure/arm-compute");
+  return new ComputeManagementClient(await getCredential(), subscriptionId);
+}
 var resourceGraphCache = /* @__PURE__ */ new Map();
 var RESOURCE_GRAPH_CACHE_TTL_MS = 6e4;
 async function queryResourceGraph(subscriptions, query, skipCache = false) {
@@ -21273,6 +21277,52 @@ async function batchExecute(tasks, batchSize = 5) {
     results.push(...batchResults);
   }
   return results;
+}
+async function getVmBootDiagnostics(subscriptionId, resourceGroup, vmName) {
+  try {
+    const client = await createComputeClient(subscriptionId);
+    const instanceView = await withRetry(
+      () => client.virtualMachines.instanceView(resourceGroup, vmName)
+    );
+    const statuses = instanceView.statuses ?? [];
+    const powerStatus = statuses.find((s) => s.code?.startsWith("PowerState/"));
+    const provStatus = statuses.find((s) => s.code?.startsWith("ProvisioningState/"));
+    const agentStatuses = instanceView.vmAgent?.statuses ?? [];
+    const agentReady = agentStatuses.find((s) => s.code?.includes("ProvisioningState/"));
+    const instanceInfo = {
+      powerState: powerStatus?.displayStatus ?? "Unknown",
+      provisioningState: provStatus?.displayStatus ?? "Unknown",
+      vmAgentStatus: agentReady?.displayStatus ?? "Not reporting",
+      vmAgentVersion: instanceView.vmAgent?.vmAgentVersion ?? "Unknown"
+    };
+    let serialConsoleLog = null;
+    try {
+      const bootDiagData = await withRetry(
+        () => client.virtualMachines.retrieveBootDiagnosticsData(resourceGroup, vmName)
+      );
+      if (bootDiagData.serialConsoleLogBlobUri) {
+        const response = await fetch(bootDiagData.serialConsoleLogBlobUri);
+        if (response.ok) {
+          const fullLog = await response.text();
+          const MAX_LOG_SIZE = 4096;
+          serialConsoleLog = fullLog.length > MAX_LOG_SIZE ? fullLog.slice(-MAX_LOG_SIZE) : fullLog;
+        }
+      }
+    } catch {
+    }
+    return { instanceInfo, serialConsoleLog };
+  } catch (err) {
+    return {
+      instanceInfo: {
+        powerState: "Unknown",
+        provisioningState: "Unknown",
+        vmAgentStatus: "Unknown",
+        vmAgentVersion: "Unknown"
+      },
+      serialConsoleLog: null,
+      error: classifyError(err, "vmBootDiagnostics")
+    };
+  }
 }
 
 // src/tools/healthcheck.ts
@@ -21936,6 +21986,28 @@ function registerInvestigate(server2) {
           }
         }
       }
+      let vmBootDiagnostics = null;
+      if (resourceType.toLowerCase() === "microsoft.compute/virtualmachines" && resolvedRG) {
+        const memMetric = metricSummaries.find((m) => m.name === "Available Memory Percentage");
+        const cpuMetric = metricSummaries.find((m) => m.name === "Percentage CPU");
+        const memoryAtZero = memMetric && memMetric.current === 0;
+        const cpuNearZero = cpuMetric && (cpuMetric.current ?? 0) < 5;
+        const healthUnhealthy = currentHealth !== "Available";
+        const possibleBootFailure = memoryAtZero && cpuNearZero || healthUnhealthy;
+        const bootDiag = await getVmBootDiagnostics(subscription, resolvedRG, resourceName);
+        if (bootDiag.error) errors.push(bootDiag.error);
+        vmBootDiagnostics = {
+          instanceInfo: bootDiag.instanceInfo,
+          possibleBootFailure
+        };
+        if (possibleBootFailure && bootDiag.serialConsoleLog) {
+          vmBootDiagnostics.serialConsoleLog = bootDiag.serialConsoleLog;
+          vmBootDiagnostics.note = "Serial console log retrieved because boot failure indicators were detected (Available Memory at 0%, low CPU, or Resource Health unhealthy). Check the log for Windows boot errors such as BCD corruption, missing winload.efi, or blue-screen codes.";
+        } else if (possibleBootFailure && !bootDiag.serialConsoleLog) {
+          vmBootDiagnostics.serialConsoleLog = null;
+          vmBootDiagnostics.note = "Boot failure indicators detected but serial console log is unavailable. Ensure boot diagnostics are enabled on the VM (az vm boot-diagnostics enable).";
+        }
+      }
       const response = {
         resource: resourceName,
         resourceType,
@@ -21969,6 +22041,9 @@ function registerInvestigate(server2) {
       }
       if (resourceSpecificLogs) {
         response.resourceDiagnostics = resourceSpecificLogs;
+      }
+      if (vmBootDiagnostics) {
+        response.vmBootDiagnostics = vmBootDiagnostics;
       }
       if (dependencies.length > 0) {
         response.dependencies = dependencies;

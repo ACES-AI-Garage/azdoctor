@@ -10,6 +10,7 @@ import {
   batchExecute,
   discoverWorkspaces,
   queryLogAnalytics,
+  getVmBootDiagnostics,
 } from "../utils/azure-client.js";
 import type { AzureError } from "../utils/azure-client.js";
 
@@ -553,6 +554,48 @@ export function registerInvestigate(server: McpServer): void {
         }
       }
 
+      // ── 8c. VM Boot Diagnostics ──────────────────────────────────────
+      // For VMs: detect potential boot failures from metrics/health and
+      // automatically retrieve serial console log + instance view.
+      let vmBootDiagnostics: Record<string, unknown> | null = null;
+
+      if (resourceType.toLowerCase() === "microsoft.compute/virtualmachines" && resolvedRG) {
+        // Check for boot failure signals from already-collected data:
+        // - Available Memory at 0%
+        // - Resource Health is Unavailable
+        // - Very low CPU (< 5%) combined with zero memory
+        const memMetric = metricSummaries.find((m) => m.name === "Available Memory Percentage");
+        const cpuMetric = metricSummaries.find((m) => m.name === "Percentage CPU");
+
+        const memoryAtZero = memMetric && memMetric.current === 0;
+        const cpuNearZero = cpuMetric && (cpuMetric.current ?? 0) < 5;
+        const healthUnhealthy = currentHealth !== "Available";
+        const possibleBootFailure = (memoryAtZero && cpuNearZero) || healthUnhealthy;
+
+        // Always fetch instance view for VMs; include serial console log
+        // when a boot failure is suspected
+        const bootDiag = await getVmBootDiagnostics(subscription, resolvedRG, resourceName);
+        if (bootDiag.error) errors.push(bootDiag.error);
+
+        vmBootDiagnostics = {
+          instanceInfo: bootDiag.instanceInfo,
+          possibleBootFailure,
+        };
+
+        if (possibleBootFailure && bootDiag.serialConsoleLog) {
+          (vmBootDiagnostics as Record<string, unknown>).serialConsoleLog = bootDiag.serialConsoleLog;
+          (vmBootDiagnostics as Record<string, unknown>).note =
+            "Serial console log retrieved because boot failure indicators were detected " +
+            "(Available Memory at 0%, low CPU, or Resource Health unhealthy). " +
+            "Check the log for Windows boot errors such as BCD corruption, missing winload.efi, or blue-screen codes.";
+        } else if (possibleBootFailure && !bootDiag.serialConsoleLog) {
+          (vmBootDiagnostics as Record<string, unknown>).serialConsoleLog = null;
+          (vmBootDiagnostics as Record<string, unknown>).note =
+            "Boot failure indicators detected but serial console log is unavailable. " +
+            "Ensure boot diagnostics are enabled on the VM (az vm boot-diagnostics enable).";
+        }
+      }
+
       // ── 9. Build response — raw data, no opinions ────────────────────
       const response: Record<string, unknown> = {
         resource: resourceName,
@@ -600,6 +643,11 @@ export function registerInvestigate(server: McpServer): void {
       // Resource-specific diagnostics (Container Insights, SQL diagnostics, etc.)
       if (resourceSpecificLogs) {
         response.resourceDiagnostics = resourceSpecificLogs;
+      }
+
+      // VM Boot Diagnostics (instance view, serial console log)
+      if (vmBootDiagnostics) {
+        response.vmBootDiagnostics = vmBootDiagnostics;
       }
 
       // Dependencies

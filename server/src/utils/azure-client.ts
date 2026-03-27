@@ -13,6 +13,7 @@ type LogsQueryClient = import("@azure/monitor-query").LogsQueryClient;
 type MetricsQueryClient = import("@azure/monitor-query").MetricsQueryClient;
 type MetricsQueryResult = import("@azure/monitor-query").MetricsQueryResult;
 type MicrosoftSupport = import("@azure/arm-support").MicrosoftSupport;
+type ComputeManagementClient = import("@azure/arm-compute").ComputeManagementClient;
 
 // ─── Shared credential ──────────────────────────────────────────────
 
@@ -169,6 +170,11 @@ export async function createMetricsQueryClient(): Promise<MetricsQueryClient> {
 export async function createSupportClient(subscriptionId: string): Promise<MicrosoftSupport> {
   const { MicrosoftSupport } = await import("@azure/arm-support");
   return new MicrosoftSupport(await getCredential(), subscriptionId);
+}
+
+export async function createComputeClient(subscriptionId: string): Promise<ComputeManagementClient> {
+  const { ComputeManagementClient } = await import("@azure/arm-compute");
+  return new ComputeManagementClient(await getCredential(), subscriptionId);
 }
 
 // ─── Resource Graph ──────────────────────────────────────────────────
@@ -526,4 +532,88 @@ export async function batchExecute<T>(
   }
 
   return results;
+}
+
+// ─── VM Boot Diagnostics ────────────────────────────────────────────
+
+export interface VmInstanceInfo {
+  powerState: string;
+  provisioningState: string;
+  vmAgentStatus: string;
+  vmAgentVersion: string;
+}
+
+export interface VmBootDiagnosticsResult {
+  instanceInfo: VmInstanceInfo;
+  serialConsoleLog: string | null;
+  error?: AzureError;
+}
+
+/**
+ * Retrieve VM instance view (power state, agent status) and serial console
+ * boot log. The serial console log contains Windows boot manager output,
+ * including BCD errors, missing file references, and blue-screen codes.
+ */
+export async function getVmBootDiagnostics(
+  subscriptionId: string,
+  resourceGroup: string,
+  vmName: string
+): Promise<VmBootDiagnosticsResult> {
+  try {
+    const client = await createComputeClient(subscriptionId);
+
+    // Get instance view for power state and VM agent status
+    const instanceView = await withRetry(() =>
+      client.virtualMachines.instanceView(resourceGroup, vmName)
+    );
+
+    const statuses = instanceView.statuses ?? [];
+    const powerStatus = statuses.find((s) => s.code?.startsWith("PowerState/"));
+    const provStatus = statuses.find((s) => s.code?.startsWith("ProvisioningState/"));
+
+    const agentStatuses = instanceView.vmAgent?.statuses ?? [];
+    const agentReady = agentStatuses.find((s) => s.code?.includes("ProvisioningState/"));
+
+    const instanceInfo: VmInstanceInfo = {
+      powerState: powerStatus?.displayStatus ?? "Unknown",
+      provisioningState: provStatus?.displayStatus ?? "Unknown",
+      vmAgentStatus: agentReady?.displayStatus ?? "Not reporting",
+      vmAgentVersion: instanceView.vmAgent?.vmAgentVersion ?? "Unknown",
+    };
+
+    // Retrieve boot diagnostics serial console log
+    let serialConsoleLog: string | null = null;
+    try {
+      const bootDiagData = await withRetry(() =>
+        client.virtualMachines.retrieveBootDiagnosticsData(resourceGroup, vmName)
+      );
+
+      if (bootDiagData.serialConsoleLogBlobUri) {
+        const response = await fetch(bootDiagData.serialConsoleLogBlobUri);
+        if (response.ok) {
+          const fullLog = await response.text();
+          // Return the last 4KB to stay within reasonable response size
+          const MAX_LOG_SIZE = 4096;
+          serialConsoleLog = fullLog.length > MAX_LOG_SIZE
+            ? fullLog.slice(-MAX_LOG_SIZE)
+            : fullLog;
+        }
+      }
+    } catch {
+      // Boot diagnostics may not be enabled — not a fatal error
+    }
+
+    return { instanceInfo, serialConsoleLog };
+  } catch (err) {
+    return {
+      instanceInfo: {
+        powerState: "Unknown",
+        provisioningState: "Unknown",
+        vmAgentStatus: "Unknown",
+        vmAgentVersion: "Unknown",
+      },
+      serialConsoleLog: null,
+      error: classifyError(err, "vmBootDiagnostics"),
+    };
+  }
 }

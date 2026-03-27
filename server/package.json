@@ -12,6 +12,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@azure/arm-compute": "^22.0.0",
     "@azure/arm-monitor": "^7.0.0",
     "@azure/arm-resourcegraph": "^4.0.0",
     "@azure/arm-resourcehealth": "^4.0.0",
