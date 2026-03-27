@@ -434,6 +434,125 @@ export function registerInvestigate(server: McpServer): void {
         }
       }
 
+      // ── 8b. Resource-specific Log Analytics queries ─────────────────
+      // For AKS: Container Insights (pod status, OOMKills, container logs)
+      // For SQL: Diagnostic tables (query stats, wait stats, deadlocks)
+      let resourceSpecificLogs: Record<string, unknown> | null = null;
+
+      if (resolvedRG) {
+        const wsResult2 = logData ? null : await discoverWorkspaces(subscription, resolvedRG);
+        const wsId = logData
+          ? (await discoverWorkspaces(subscription, resolvedRG)).workspaces[0]?.workspaceId
+          : wsResult2?.workspaces[0]?.workspaceId;
+
+        if (wsId) {
+          const typeLower = resourceType.toLowerCase();
+
+          if (typeLower === "microsoft.containerservice/managedclusters") {
+            // AKS Container Insights queries
+            const [podStatus, oomKills, containerRestarts, nodePerf] = await Promise.all([
+              queryLogAnalytics(wsId, `KubePodInventory
+| where TimeGenerated > ago(${effectiveHours}h)
+| where ClusterName =~ '${resourceName}'
+| where PodStatus in ('Failed', 'Unknown', 'Pending')
+| summarize Count = count() by PodStatus, Namespace, Name
+| order by Count desc
+| take 20`, effectiveHours),
+              queryLogAnalytics(wsId, `KubeEvents
+| where TimeGenerated > ago(${effectiveHours}h)
+| where ClusterName =~ '${resourceName}'
+| where Reason in ('OOMKilling', 'BackOff', 'Unhealthy', 'FailedScheduling', 'Evicted')
+| summarize Count = count() by Reason, Namespace, Name, Message
+| order by Count desc
+| take 20`, effectiveHours),
+              queryLogAnalytics(wsId, `ContainerInventory
+| where TimeGenerated > ago(${effectiveHours}h)
+| where ContainerState == 'Failed' or RestartCount > 3
+| summarize MaxRestarts = max(RestartCount), arg_max(TimeGenerated, ContainerState, ExitCode) by ContainerHostname, Name, Image
+| order by MaxRestarts desc
+| take 15`, effectiveHours),
+              queryLogAnalytics(wsId, `InsightsMetrics
+| where TimeGenerated > ago(${effectiveHours}h)
+| where Namespace == 'container.azm.ms/kubestate'
+| where Name in ('restartingContainerCount', 'oomKilledContainerCount', 'podReadyPercentage')
+| summarize Value = avg(Val) by Name, bin(TimeGenerated, 5m)
+| order by TimeGenerated desc
+| take 50`, effectiveHours),
+            ]);
+
+            resourceSpecificLogs = {
+              source: "Container Insights",
+              unhealthyPods: (podStatus.tables?.[0]?.rows ?? []).map((r) => ({
+                status: String(r[0] ?? ""), namespace: String(r[1] ?? ""),
+                pod: String(r[2] ?? ""), count: Number(r[3]) || 0,
+              })),
+              kubeEvents: (oomKills.tables?.[0]?.rows ?? []).map((r) => ({
+                reason: String(r[0] ?? ""), namespace: String(r[1] ?? ""),
+                resource: String(r[2] ?? ""), message: String(r[3] ?? ""),
+                count: Number(r[4]) || 0,
+              })),
+              failedContainers: (containerRestarts.tables?.[0]?.rows ?? []).map((r) => ({
+                host: String(r[0] ?? ""), container: String(r[1] ?? ""),
+                image: String(r[2] ?? ""), maxRestarts: Number(r[3]) || 0,
+                lastState: String(r[4] ?? ""), exitCode: Number(r[5]) || 0,
+              })),
+            };
+            if (podStatus.error) errors.push(podStatus.error);
+            if (oomKills.error) errors.push(oomKills.error);
+            if (containerRestarts.error) errors.push(containerRestarts.error);
+
+          } else if (typeLower.includes("microsoft.sql/") || typeLower.includes("microsoft.dbforpostgresql/")) {
+            // SQL / PostgreSQL diagnostic queries
+            const [queryStats, waitStats, deadlocks] = await Promise.all([
+              queryLogAnalytics(wsId, `AzureDiagnostics
+| where TimeGenerated > ago(${effectiveHours}h)
+| where ResourceProvider == 'MICROSOFT.SQL' or ResourceProvider == 'MICROSOFT.DBFORPOSTGRESQL'
+| where Category == 'QueryStoreRuntimeStatistics' or Category == 'QueryStoreWaitStatistics' or Category == 'PostgreSQLLogs'
+| summarize Count = count() by Category, Resource
+| order by Count desc
+| take 10`, effectiveHours),
+              queryLogAnalytics(wsId, `AzureDiagnostics
+| where TimeGenerated > ago(${effectiveHours}h)
+| where Category == 'SQLSecurityAuditEvents' or Category == 'Errors' or Category == 'Timeouts'
+| summarize Count = count() by Category, Resource
+| order by Count desc
+| take 10`, effectiveHours),
+              queryLogAnalytics(wsId, `AzureDiagnostics
+| where TimeGenerated > ago(${effectiveHours}h)
+| where Category == 'Deadlocks' or Category == 'Blocks'
+| project TimeGenerated, Category, Resource, deadlock_xml_s, lock_mode_s, blocked_process_xml_s
+| order by TimeGenerated desc
+| take 10`, effectiveHours),
+            ]);
+
+            const hasData = [queryStats, waitStats, deadlocks].some(
+              (r) => (r.tables?.[0]?.rows?.length ?? 0) > 0
+            );
+
+            if (hasData) {
+              resourceSpecificLogs = {
+                source: "SQL/PostgreSQL Diagnostics",
+                queryStats: (queryStats.tables?.[0]?.rows ?? []).map((r) => ({
+                  category: String(r[0] ?? ""), resource: String(r[1] ?? ""),
+                  count: Number(r[2]) || 0,
+                })),
+                errors: (waitStats.tables?.[0]?.rows ?? []).map((r) => ({
+                  category: String(r[0] ?? ""), resource: String(r[1] ?? ""),
+                  count: Number(r[2]) || 0,
+                })),
+                deadlocks: (deadlocks.tables?.[0]?.rows ?? []).map((r) => ({
+                  time: String(r[0] ?? ""), category: String(r[1] ?? ""),
+                  resource: String(r[2] ?? ""),
+                })),
+              };
+            }
+            if (queryStats.error) errors.push(queryStats.error);
+            if (waitStats.error) errors.push(waitStats.error);
+            if (deadlocks.error) errors.push(deadlocks.error);
+          }
+        }
+      }
+
       // ── 9. Build response — raw data, no opinions ────────────────────
       const response: Record<string, unknown> = {
         resource: resourceName,
@@ -476,6 +595,11 @@ export function registerInvestigate(server: McpServer): void {
         } else {
           response.logAnalytics = { workspace: logData.workspace, summary: "No failed requests, exceptions, or dependency failures found." };
         }
+      }
+
+      // Resource-specific diagnostics (Container Insights, SQL diagnostics, etc.)
+      if (resourceSpecificLogs) {
+        response.resourceDiagnostics = resourceSpecificLogs;
       }
 
       // Dependencies

@@ -6,4 +6,3 @@ server/build/*.map
 server/build/*.d.ts
 .env
 *.log
-demo/DEMO-WALKTHROUGH.md
