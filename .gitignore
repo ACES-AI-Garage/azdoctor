@@ -6,3 +6,4 @@ server/build/*.map
 server/build/*.d.ts
 .env
 *.log
+HANDOFF.md
