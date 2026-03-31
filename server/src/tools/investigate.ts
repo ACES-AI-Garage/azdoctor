@@ -6,8 +6,10 @@ import {
   getResourceHealth,
   getActivityLogs,
   getMetrics,
+  querySqlQueryStore,
 } from "../utils/azure-client.js";
 import type { AzureError } from "../utils/azure-client.js";
+import type { QueryStoreInsight } from "../utils/azure-client.js";
 import {
   correlateTimelines,
   detectMetricAnomalies,
@@ -253,6 +255,64 @@ export function registerInvestigate(server: McpServer): void {
         }
       }
 
+      // 6b. SQL DB Query Store — auto-query when performance anomalies detected
+      let queryStoreInsights: QueryStoreInsight[] | undefined;
+      if (resourceType.toLowerCase() === "microsoft.sql/servers/databases") {
+        const hasPerformanceAnomaly = allEvents.some(
+          (e) =>
+            e.source === "Metrics" &&
+            (e.severity === "warning" || e.severity === "critical")
+        );
+        // Query Store is valuable even without anomalies for perf investigation
+        if (hasPerformanceAnomaly || (symptom && /slow|perf|cpu|dtu|query|latenc/i.test(symptom))) {
+          // Extract server name and database name from the resource ID
+          // Format: /subscriptions/.../providers/Microsoft.Sql/servers/{server}/databases/{db}
+          const idParts = resourceId.split("/");
+          const serversIdx = idParts.findIndex(
+            (p) => p.toLowerCase() === "servers"
+          );
+          const dbIdx = idParts.findIndex(
+            (p) => p.toLowerCase() === "databases"
+          );
+          if (serversIdx !== -1 && dbIdx !== -1) {
+            const serverName = idParts[serversIdx + 1];
+            const dbName = idParts[dbIdx + 1];
+
+            // Resolve server FQDN from Resource Graph (handles sovereign clouds)
+            const serverRgQuery = `Resources | where type =~ 'Microsoft.Sql/servers' and name =~ '${serverName}' | project properties.fullyQualifiedDomainName | take 1`;
+            let serverFqdn = `${serverName}.database.windows.net`;
+            try {
+              const serverResult = await queryResourceGraph([subscription], serverRgQuery);
+              const fqdn = serverResult.resources[0]?.["properties_fullyQualifiedDomainName"] as string;
+              if (fqdn) serverFqdn = fqdn;
+            } catch {
+              // Fall back to default FQDN convention
+            }
+
+            const qsResult = await querySqlQueryStore(
+              serverFqdn,
+              dbName,
+              timeframeHours
+            );
+            if (qsResult.error) {
+              errors.push(qsResult.error);
+            }
+            if (qsResult.topQueries.length > 0) {
+              queryStoreInsights = qsResult.topQueries;
+              // Add top offending query as a diagnostic event
+              const topQuery = qsResult.topQueries[0];
+              allEvents.push({
+                time: topQuery.lastExecutionTime || new Date().toISOString(),
+                event: `Top resource-consuming query (ID ${topQuery.queryId}): max CPU ${topQuery.maxCpuSec}s, max duration ${topQuery.maxDurationSec}s, executions: ${topQuery.executionCount}`,
+                source: "Metrics",
+                resource: resourceName,
+                severity: topQuery.maxCpuSec > 5 ? "critical" : "warning",
+              });
+            }
+          }
+        }
+      }
+
       // 7. Correlate timestamps across all signals
       const correlation = correlateTimelines(allEvents);
 
@@ -273,6 +333,7 @@ export function registerInvestigate(server: McpServer): void {
         earliestAnomaly: correlation.earliestAnomaly,
         precedingChanges: correlation.precedingChanges,
         dependentResources,
+        queryStoreInsights: queryStoreInsights ?? undefined,
         recommendedActions: buildRecommendations(
           currentHealth,
           correlation,

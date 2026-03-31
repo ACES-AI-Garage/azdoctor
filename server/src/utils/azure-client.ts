@@ -341,3 +341,149 @@ export async function queryLogAnalytics(
     return { tables: [], error: classifyError(err, "logAnalytics") };
   }
 }
+
+// ─── SQL Query Store (Azure SQL DB) ─────────────────────────────────
+
+export interface QueryStoreInsight {
+  queryId: number;
+  querySqlText: string;
+  executionCount: number;
+  avgDurationSec: number;
+  maxDurationSec: number;
+  avgCpuSec: number;
+  maxCpuSec: number;
+  avgLogicalIoReads: number;
+  avgLogicalIoWrites: number;
+  lastExecutionTime: string;
+}
+
+export interface QueryStoreResult {
+  topQueries: QueryStoreInsight[];
+  error?: AzureError;
+}
+
+/**
+ * Query the SQL Query Store for top resource-consuming queries.
+ * Uses Azure AD token authentication via DefaultAzureCredential.
+ */
+export async function querySqlQueryStore(
+  serverFqdn: string,
+  databaseName: string,
+  timespanHours: number = 24,
+  topN: number = 10
+): Promise<QueryStoreResult> {
+  try {
+    const { Connection, Request, TYPES } = await import("tedious");
+
+    // Get AAD token for Azure SQL
+    const credential = getCredential();
+    const tokenResponse = await credential.getToken(
+      "https://database.windows.net/.default"
+    );
+    if (!tokenResponse?.token) {
+      return {
+        topQueries: [],
+        error: {
+          code: "AUTH_FAILED",
+          message: "querySqlQueryStore: Failed to acquire Azure AD token for SQL Database",
+        },
+      };
+    }
+
+    const topQueries = await new Promise<QueryStoreInsight[]>(
+      (resolve, reject) => {
+        const config = {
+          server: serverFqdn,
+          authentication: {
+            type: "azure-active-directory-access-token" as const,
+            options: { token: tokenResponse.token },
+          },
+          options: {
+            database: databaseName,
+            encrypt: true,
+            port: 1433,
+            connectTimeout: 15000,
+            requestTimeout: 30000,
+          },
+        };
+
+        const connection = new Connection(config);
+        const rows: QueryStoreInsight[] = [];
+
+        connection.on("connect", (err) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+
+          const sql = `
+            SELECT TOP (${topN})
+              qs.query_id,
+              SUBSTRING(qt.query_sql_text, 1, 500) AS query_sql_text,
+              SUM(rs.count_executions) AS count_executions,
+              AVG(rs.avg_duration / 1000000.0) AS avg_duration_sec,
+              MAX(rs.max_duration / 1000000.0) AS max_duration_sec,
+              AVG(rs.avg_cpu_time / 1000000.0) AS avg_cpu_sec,
+              MAX(rs.max_cpu_time / 1000000.0) AS max_cpu_sec,
+              AVG(rs.avg_logical_io_reads) AS avg_logical_io_reads,
+              AVG(rs.avg_logical_io_writes) AS avg_logical_io_writes,
+              MAX(rs.last_execution_time) AS last_execution_time
+            FROM sys.query_store_query qs
+            JOIN sys.query_store_query_text qt ON qs.query_text_id = qt.query_text_id
+            JOIN sys.query_store_plan qp ON qs.query_id = qp.query_id
+            JOIN sys.query_store_runtime_stats rs ON qp.plan_id = rs.plan_id
+            WHERE rs.last_execution_time > DATEADD(HOUR, -${timespanHours}, GETUTCDATE())
+            GROUP BY qs.query_id, SUBSTRING(qt.query_sql_text, 1, 500)
+            ORDER BY MAX(rs.max_cpu_time) DESC
+          `;
+
+          const request = new Request(sql, (reqErr) => {
+            connection.close();
+            if (reqErr) {
+              reject(reqErr);
+            } else {
+              resolve(rows);
+            }
+          });
+
+          request.on("row", (columns: Array<{ metadata: { colName: string }; value: unknown }>) => {
+            const row: Record<string, unknown> = {};
+            for (const col of columns) {
+              row[col.metadata.colName] = col.value;
+            }
+            rows.push({
+              queryId: row["query_id"] as number,
+              querySqlText: (row["query_sql_text"] as string) ?? "",
+              executionCount: row["count_executions"] as number,
+              avgDurationSec: Math.round(((row["avg_duration_sec"] as number) ?? 0) * 1000) / 1000,
+              maxDurationSec: Math.round(((row["max_duration_sec"] as number) ?? 0) * 1000) / 1000,
+              avgCpuSec: Math.round(((row["avg_cpu_sec"] as number) ?? 0) * 1000) / 1000,
+              maxCpuSec: Math.round(((row["max_cpu_sec"] as number) ?? 0) * 1000) / 1000,
+              avgLogicalIoReads: Math.round((row["avg_logical_io_reads"] as number) ?? 0),
+              avgLogicalIoWrites: Math.round((row["avg_logical_io_writes"] as number) ?? 0),
+              lastExecutionTime: row["last_execution_time"]?.toString() ?? "",
+            });
+          });
+
+          connection.execSql(request);
+        });
+
+        connection.connect();
+      }
+    );
+
+    return { topQueries };
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : String(err);
+    return {
+      topQueries: [],
+      error: {
+        code: "QUERY_STORE_ERROR",
+        message: `querySqlQueryStore failed: ${message}`,
+        roleRecommendation:
+          "Ensure Azure AD admin is set on the SQL server, and the identity has VIEW DATABASE STATE permission.",
+      },
+    };
+  }
+}

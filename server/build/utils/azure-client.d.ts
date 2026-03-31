@@ -57,4 +57,25 @@ export interface LogAnalyticsResult {
     error?: AzureError;
 }
 export declare function queryLogAnalytics(workspaceId: string, query: string, timespanHours?: number): Promise<LogAnalyticsResult>;
+export interface QueryStoreInsight {
+    queryId: number;
+    querySqlText: string;
+    executionCount: number;
+    avgDurationSec: number;
+    maxDurationSec: number;
+    avgCpuSec: number;
+    maxCpuSec: number;
+    avgLogicalIoReads: number;
+    avgLogicalIoWrites: number;
+    lastExecutionTime: string;
+}
+export interface QueryStoreResult {
+    topQueries: QueryStoreInsight[];
+    error?: AzureError;
+}
+/**
+ * Query the SQL Query Store for top resource-consuming queries.
+ * Uses Azure AD token authentication via DefaultAzureCredential.
+ */
+export declare function querySqlQueryStore(serverFqdn: string, databaseName: string, timespanHours?: number, topN?: number): Promise<QueryStoreResult>;
 //# sourceMappingURL=azure-client.d.ts.map
