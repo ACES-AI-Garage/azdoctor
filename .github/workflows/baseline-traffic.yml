@@ -2,8 +2,12 @@ name: Baseline Traffic
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # Every 15 minutes
-  workflow_dispatch: # Manual trigger for testing
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: baseline-traffic
+  cancel-in-progress: false
 
 jobs:
   send-traffic:
