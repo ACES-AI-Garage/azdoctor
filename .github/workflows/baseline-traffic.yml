@@ -12,14 +12,17 @@ concurrency:
 jobs:
   send-traffic:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
     steps:
       - name: Send baseline traffic
         run: |
           APP_URL="https://app-azdemo-prod-30bf1e4b.azurewebsites.net"
-          for i in $(seq 1 10); do
+          AKS_URL="http://4.153.50.51"
+          for i in $(seq 1 5); do
             curl -s -o /dev/null --max-time 10 "$APP_URL/health" || true
-            curl -s -o /dev/null --max-time 10 "$APP_URL/api/data" || true
-            sleep 2
+            curl -s -o /dev/null --max-time 15 "$APP_URL/api/data" || true
+            curl -s -o /dev/null --max-time 10 "$AKS_URL/health" || true
+            curl -s -o /dev/null --max-time 15 "$AKS_URL/api/data" || true
+            sleep 3
           done
           echo "Baseline traffic sent at $(date -u)"
