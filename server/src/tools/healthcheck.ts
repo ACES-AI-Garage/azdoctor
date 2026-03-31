@@ -5,6 +5,8 @@ import {
   queryResourceGraph,
   batchResourceHealth,
   getActivityLogs,
+  queryRoleAssignments,
+  queryRbacActivityFailures,
 } from "../utils/azure-client.js";
 import type { AzureError } from "../utils/azure-client.js";
 
@@ -78,10 +80,12 @@ export function registerHealthcheck(server: McpServer): void {
             "    lastUpdated = properties.lastUpdated",
           ].join("\n");
 
-      const [healthResult, activityResult, advisorResult] = await Promise.all([
+      const [healthResult, activityResult, advisorResult, rbacAssignmentResult, rbacFailuresResult] = await Promise.all([
         batchResourceHealth(subscription, resourceGroup),
         getActivityLogs(subscription, 24, undefined, resourceGroup),
         queryResourceGraph([subscription], advisorQuery),
+        queryRoleAssignments(subscription),
+        queryRbacActivityFailures(subscription, 24),
       ]);
 
       // 3. Process Resource Health findings
@@ -221,7 +225,72 @@ export function registerHealthcheck(server: McpServer): void {
         }
       }
 
-      // 6. Filter by severity threshold
+      // 6. RBAC risk findings
+      if (rbacAssignmentResult.error) {
+        errors.push(rbacAssignmentResult.error);
+      } else {
+        const assignmentCount = rbacAssignmentResult.totalCount;
+        if (assignmentCount > 3900) {
+          findings.push({
+            severity: "critical",
+            resource: subscription,
+            resourceType: "Subscription",
+            category: "RBAC",
+            issue: `Role assignment count (${assignmentCount}/4000) is critically high`,
+            evidence: { current: assignmentCount, max: 4000 },
+            recommendation: "Remove orphaned and redundant role assignments. Use group-based assignments to consolidate. Run azdoctor_rbac_audit for details.",
+          });
+        } else if (assignmentCount > 3500) {
+          findings.push({
+            severity: "warning",
+            resource: subscription,
+            resourceType: "Subscription",
+            category: "RBAC",
+            issue: `Role assignment count (${assignmentCount}/4000) is approaching the limit`,
+            evidence: { current: assignmentCount, max: 4000 },
+            recommendation: "Plan to consolidate role assignments. Run azdoctor_rbac_audit for details.",
+          });
+        }
+
+        // Detect orphaned assignments
+        const orphanedCount = rbacAssignmentResult.assignments.filter(
+          (a) => !a.principalType || a.principalType === "" || a.principalType === "Unknown"
+        ).length;
+        if (orphanedCount > 0) {
+          findings.push({
+            severity: "warning",
+            resource: subscription,
+            resourceType: "Subscription",
+            category: "RBAC",
+            issue: `${orphanedCount} orphaned role assignment(s) reference deleted principals`,
+            evidence: { orphanedCount },
+            recommendation: "Remove orphaned role assignments to free up quota. Run azdoctor_rbac_audit for details.",
+          });
+        }
+      }
+
+      if (rbacFailuresResult.error) {
+        errors.push(rbacFailuresResult.error);
+      } else if (rbacFailuresResult.failures.length > 0) {
+        findings.push({
+          severity: "warning",
+          resource: subscription,
+          resourceType: "Subscription",
+          category: "RBAC",
+          issue: `${rbacFailuresResult.failures.length} AuthorizationFailed event(s) in the last 24 hours`,
+          evidence: {
+            count: rbacFailuresResult.failures.length,
+            topFailures: rbacFailuresResult.failures.slice(0, 3).map((f) => ({
+              operation: f.operation,
+              errorCode: f.errorCode,
+              caller: f.caller,
+            })),
+          },
+          recommendation: "Review authorization failures and assign required roles. Run azdoctor_rbac_audit for details.",
+        });
+      }
+
+      // 7. Filter by severity threshold
       const severityRank: Record<string, number> = {
         critical: 3,
         warning: 2,
@@ -248,6 +317,7 @@ export function registerHealthcheck(server: McpServer): void {
       const advisorCount = filtered.filter((f) => f.category?.startsWith("Advisor")).length;
       const healthCount = filtered.filter((f) => f.category === "Resource Health").length;
       const activityCount = filtered.filter((f) => f.category === "Activity Log").length;
+      const rbacCount = filtered.filter((f) => f.category === "RBAC").length;
 
       const response = {
         riskScore,
@@ -256,6 +326,7 @@ export function registerHealthcheck(server: McpServer): void {
           resourceHealth: healthCount,
           azureAdvisor: advisorCount,
           activityLog: activityCount,
+          rbac: rbacCount,
         },
         findings: filtered,
         scannedResources,

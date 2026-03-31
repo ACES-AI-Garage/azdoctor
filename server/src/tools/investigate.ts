@@ -10,6 +10,7 @@ import {
   batchExecute,
   discoverWorkspaces,
   queryLogAnalytics,
+  getRecommendedRoleForOperation,
 } from "../utils/azure-client.js";
 import type { AzureError } from "../utils/azure-client.js";
 
@@ -177,16 +178,39 @@ export function registerInvestigate(server: McpServer): void {
       if (activityResult.error) {
         errors.push(activityResult.error);
       } else {
+        const RBAC_ERROR_CODES = [
+          "AuthorizationFailed", "LinkedAuthorizationFailed",
+          "RoleAssignmentLimitExceeded", "RoleDefinitionLimitExceeded",
+          "PrincipalNotFound", "RoleAssignmentUpdateNotPermitted",
+        ];
+
         for (const event of activityResult.events) {
           const status = event.status?.value ?? "";
           const op = event.operationName?.value ?? "";
           if (status === "Failed" || op.includes("write") || op.includes("deploy") || op.includes("restart") || op.includes("delete") || op.includes("action")) {
-            recentChanges.push({
+            const entry: Record<string, unknown> = {
               time: event.eventTimestamp?.toISOString(),
               operation: event.operationName?.localizedValue ?? op,
               status,
               caller: event.caller,
-            });
+            };
+
+            // Extract RBAC-specific failure details
+            if (status === "Failed") {
+              const subStatus = event.subStatus?.value ?? "";
+              const statusMessage = (event.properties as Record<string, string> | undefined)?.statusMessage ?? "";
+
+              const matchedCode = RBAC_ERROR_CODES.find(
+                (code) => subStatus.includes(code) || statusMessage.includes(code)
+              );
+              if (matchedCode) {
+                entry.rbacError = true;
+                entry.errorCode = matchedCode;
+                entry.recommendedRole = getRecommendedRoleForOperation(op);
+              }
+            }
+
+            recentChanges.push(entry);
           }
         }
       }

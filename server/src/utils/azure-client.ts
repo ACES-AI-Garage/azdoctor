@@ -527,3 +527,173 @@ export async function batchExecute<T>(
 
   return results;
 }
+
+// ─── RBAC Queries ────────────────────────────────────────────────────
+
+export interface RoleAssignmentInfo {
+  id: string;
+  principalId: string;
+  principalType: string;
+  roleDefinitionId: string;
+  scope: string;
+  createdOn: string;
+}
+
+export async function queryRoleAssignments(
+  subscriptionId: string,
+  scope?: string
+): Promise<{ assignments: RoleAssignmentInfo[]; totalCount: number; error?: AzureError }> {
+  const scopeFilter = scope
+    ? `| where tolower(properties.scope) startswith tolower("${scope}")`
+    : "";
+  const query = `authorizationresources
+| where type =~ "microsoft.authorization/roleassignments"
+| where id startswith "/subscriptions/${subscriptionId}"
+${scopeFilter}
+| extend principalId = tostring(properties.principalId)
+| extend principalType = tostring(properties.principalType)
+| extend roleDefinitionId = tolower(tostring(properties.roleDefinitionId))
+| extend scope = tolower(tostring(properties.scope))
+| extend createdOn = tostring(properties.createdOn)
+| project id, principalId, principalType, roleDefinitionId, scope, createdOn`;
+
+  const result = await queryResourceGraph([subscriptionId], query);
+  if (result.error) {
+    return { assignments: [], totalCount: 0, error: result.error };
+  }
+  const assignments: RoleAssignmentInfo[] = result.resources.map((r) => ({
+    id: String(r["id"] ?? ""),
+    principalId: String(r["principalId"] ?? ""),
+    principalType: String(r["principalType"] ?? ""),
+    roleDefinitionId: String(r["roleDefinitionId"] ?? ""),
+    scope: String(r["scope"] ?? ""),
+    createdOn: String(r["createdOn"] ?? ""),
+  }));
+  return { assignments, totalCount: result.totalRecords };
+}
+
+export interface CustomRoleInfo {
+  id: string;
+  roleName: string;
+  assignableScopes: unknown;
+}
+
+export async function queryCustomRoleDefinitions(
+  subscriptionId: string
+): Promise<{ roles: CustomRoleInfo[]; totalCount: number; error?: AzureError }> {
+  const query = `authorizationresources
+| where type =~ "microsoft.authorization/roledefinitions"
+| where tolower(tostring(properties.type)) == "customrole"
+| where id startswith "/subscriptions/${subscriptionId}"
+| extend roleName = tostring(properties.roleName)
+| extend assignableScopes = properties.assignableScopes
+| project id, roleName, assignableScopes`;
+
+  const result = await queryResourceGraph([subscriptionId], query);
+  if (result.error) {
+    return { roles: [], totalCount: 0, error: result.error };
+  }
+  const roles: CustomRoleInfo[] = result.resources.map((r) => ({
+    id: String(r["id"] ?? ""),
+    roleName: String(r["roleName"] ?? ""),
+    assignableScopes: r["assignableScopes"],
+  }));
+  return { roles, totalCount: result.totalRecords };
+}
+
+export interface RbacActivityFailure {
+  time: string;
+  operation: string;
+  errorCode: string;
+  caller: string;
+  scope: string;
+  recommendation: string;
+}
+
+const RBAC_ERROR_CODES = [
+  "AuthorizationFailed",
+  "LinkedAuthorizationFailed",
+  "RoleAssignmentLimitExceeded",
+  "RoleDefinitionLimitExceeded",
+  "PrincipalNotFound",
+  "RoleAssignmentUpdateNotPermitted",
+];
+
+const OPERATION_ROLE_MAP: Record<string, string> = {
+  "microsoft.compute/virtualmachines/write": "Virtual Machine Contributor",
+  "microsoft.web/sites/write": "Website Contributor",
+  "microsoft.storage/storageaccounts/write": "Storage Account Contributor",
+  "microsoft.sql/servers/write": "SQL Server Contributor",
+  "microsoft.network/virtualnetworks/write": "Network Contributor",
+  "microsoft.keyvault/vaults/write": "Key Vault Contributor",
+  "microsoft.authorization/roleassignments/write": "User Access Administrator or Owner",
+  "microsoft.resources/subscriptions/resourcegroups/write": "Contributor",
+  "microsoft.containerservice/managedclusters/write": "Azure Kubernetes Service Contributor",
+  "microsoft.containerregistry/registries/write": "AcrPush or Contributor",
+};
+
+export function getRecommendedRoleForOperation(operation: string): string {
+  const op = operation.toLowerCase();
+  for (const [key, role] of Object.entries(OPERATION_ROLE_MAP)) {
+    if (op.includes(key)) return role;
+  }
+  // Generic fallback based on action type
+  if (op.includes("/write") || op.includes("/deploy")) return "Contributor at the appropriate scope";
+  if (op.includes("/delete")) return "Contributor or Owner at the appropriate scope";
+  if (op.includes("/action")) return "A role with the specific action permission";
+  return "Check required permissions for this operation on Microsoft Learn";
+}
+
+export async function queryRbacActivityFailures(
+  subscriptionId: string,
+  hoursBack: number = 24
+): Promise<{ failures: RbacActivityFailure[]; error?: AzureError }> {
+  const activityResult = await getActivityLogs(subscriptionId, hoursBack);
+  if (activityResult.error) {
+    return { failures: [], error: activityResult.error };
+  }
+
+  const failures: RbacActivityFailure[] = [];
+  for (const event of activityResult.events) {
+    const status = event.status?.value ?? "";
+    if (status !== "Failed") continue;
+
+    const subStatus = event.subStatus?.value ?? "";
+    const op = event.operationName?.value ?? "";
+    const statusMessage = (event.properties as Record<string, string> | undefined)?.statusMessage ?? "";
+
+    const isRbacFailure =
+      RBAC_ERROR_CODES.some((code) => subStatus.includes(code) || statusMessage.includes(code)) ||
+      (op.toLowerCase().startsWith("microsoft.authorization/") && status === "Failed");
+
+    if (!isRbacFailure) continue;
+
+    const errorCode = RBAC_ERROR_CODES.find(
+      (code) => subStatus.includes(code) || statusMessage.includes(code)
+    ) ?? "AuthorizationFailed";
+
+    let recommendation: string;
+    if (errorCode === "PrincipalNotFound") {
+      recommendation = "The principal may not have replicated yet. Wait a few minutes and retry, or verify the principal object ID.";
+    } else if (errorCode === "RoleAssignmentLimitExceeded") {
+      recommendation = "Subscription has reached the 4000 role assignment limit. Remove unused or orphaned assignments.";
+    } else if (errorCode === "RoleDefinitionLimitExceeded") {
+      recommendation = "Subscription has reached the 5000 custom role definition limit. Remove unused custom roles.";
+    } else if (errorCode === "RoleAssignmentUpdateNotPermitted") {
+      recommendation = "Cannot modify this role assignment. Check if it is a deny assignment or system-managed.";
+    } else {
+      recommendation = `Assign ${getRecommendedRoleForOperation(op)} at the resource group or resource scope.`;
+    }
+
+    failures.push({
+      time: event.eventTimestamp?.toISOString() ?? "",
+      operation: event.operationName?.localizedValue ?? op,
+      errorCode,
+      caller: event.caller ?? "unknown",
+      scope: event.resourceId ?? "",
+      recommendation,
+    });
+  }
+
+  return { failures };
+}
