@@ -8,3 +8,4 @@ server/build/*.d.ts
 *.log
 HANDOFF.md
 demo/
+.github/
