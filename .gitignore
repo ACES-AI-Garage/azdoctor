@@ -7,3 +7,4 @@ server/build/*.d.ts
 .env
 *.log
 HANDOFF.md
+demo/
