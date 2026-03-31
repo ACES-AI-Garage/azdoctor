@@ -6,10 +6,11 @@ import { registerBaseline } from "./tools/baseline.js";
 import { registerCompare } from "./tools/compare.js";
 import { registerRemediate } from "./tools/remediate.js";
 import { registerAlertRules } from "./tools/alertRules.js";
+import { registerRbacAudit } from "./tools/rbacAudit.js";
 
 const server = new McpServer({
   name: "azdoctor",
-  version: "0.2.0",
+  version: "0.3.0",
 });
 
 registerHealthcheck(server);
@@ -18,6 +19,7 @@ registerBaseline(server);
 registerCompare(server);
 registerRemediate(server);
 registerAlertRules(server);
+registerRbacAudit(server);
 
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();

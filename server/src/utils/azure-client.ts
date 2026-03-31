@@ -517,6 +517,194 @@ export async function discoverWorkspaces(
   return { workspaces };
 }
 
+// ─── SQL Query Store (Azure SQL DB) ─────────────────────────────────
+
+export interface QueryStoreInsight {
+  queryId: number;
+  querySqlText: string;
+  executionCount: number;
+  avgDurationSec: number;
+  maxDurationSec: number;
+  avgCpuSec: number;
+  maxCpuSec: number;
+  avgLogicalIoReads: number;
+  avgLogicalIoWrites: number;
+  lastExecutionTime: string;
+}
+
+export interface QueryStoreResult {
+  topQueries: QueryStoreInsight[];
+  error?: AzureError;
+}
+
+export async function querySqlQueryStore(
+  serverFqdn: string,
+  databaseName: string,
+  timespanHours: number = 24,
+  topN: number = 10
+): Promise<QueryStoreResult> {
+  try {
+    const { Connection, Request } = await import("tedious");
+    const credential = await getCredential();
+    const tokenResponse = await credential.getToken("https://database.windows.net/.default");
+    if (!tokenResponse?.token) {
+      return { topQueries: [], error: { code: "AUTH_FAILED", message: "Failed to acquire Azure AD token for SQL Database" } };
+    }
+
+    const topQueries = await new Promise<QueryStoreInsight[]>((resolve, reject) => {
+      const connection = new Connection({
+        server: serverFqdn,
+        authentication: { type: "azure-active-directory-access-token" as const, options: { token: tokenResponse.token } },
+        options: { database: databaseName, encrypt: true, port: 1433, connectTimeout: 15000, requestTimeout: 30000 },
+      });
+      const rows: QueryStoreInsight[] = [];
+
+      connection.on("connect", (err) => {
+        if (err) { reject(err); return; }
+        const sql = `SELECT TOP (${topN})
+          qs.query_id, SUBSTRING(qt.query_sql_text, 1, 500) AS query_sql_text,
+          SUM(rs.count_executions) AS count_executions,
+          AVG(rs.avg_duration / 1000000.0) AS avg_duration_sec, MAX(rs.max_duration / 1000000.0) AS max_duration_sec,
+          AVG(rs.avg_cpu_time / 1000000.0) AS avg_cpu_sec, MAX(rs.max_cpu_time / 1000000.0) AS max_cpu_sec,
+          AVG(rs.avg_logical_io_reads) AS avg_logical_io_reads, AVG(rs.avg_logical_io_writes) AS avg_logical_io_writes,
+          MAX(rs.last_execution_time) AS last_execution_time
+        FROM sys.query_store_query qs
+        JOIN sys.query_store_query_text qt ON qs.query_text_id = qt.query_text_id
+        JOIN sys.query_store_plan qp ON qs.query_id = qp.query_id
+        JOIN sys.query_store_runtime_stats rs ON qp.plan_id = rs.plan_id
+        WHERE rs.last_execution_time > DATEADD(HOUR, -${timespanHours}, GETUTCDATE())
+        GROUP BY qs.query_id, SUBSTRING(qt.query_sql_text, 1, 500)
+        ORDER BY MAX(rs.max_cpu_time) DESC`;
+
+        const request = new Request(sql, (reqErr) => { connection.close(); if (reqErr) reject(reqErr); else resolve(rows); });
+        request.on("row", (columns: Array<{ metadata: { colName: string }; value: unknown }>) => {
+          const row: Record<string, unknown> = {};
+          for (const col of columns) row[col.metadata.colName] = col.value;
+          rows.push({
+            queryId: row["query_id"] as number, querySqlText: (row["query_sql_text"] as string) ?? "",
+            executionCount: row["count_executions"] as number,
+            avgDurationSec: Math.round(((row["avg_duration_sec"] as number) ?? 0) * 1000) / 1000,
+            maxDurationSec: Math.round(((row["max_duration_sec"] as number) ?? 0) * 1000) / 1000,
+            avgCpuSec: Math.round(((row["avg_cpu_sec"] as number) ?? 0) * 1000) / 1000,
+            maxCpuSec: Math.round(((row["max_cpu_sec"] as number) ?? 0) * 1000) / 1000,
+            avgLogicalIoReads: Math.round((row["avg_logical_io_reads"] as number) ?? 0),
+            avgLogicalIoWrites: Math.round((row["avg_logical_io_writes"] as number) ?? 0),
+            lastExecutionTime: row["last_execution_time"]?.toString() ?? "",
+          });
+        });
+        connection.execSql(request);
+      });
+      connection.connect();
+    });
+    return { topQueries };
+  } catch (err) {
+    return { topQueries: [], error: { code: "QUERY_STORE_ERROR", message: `querySqlQueryStore failed: ${err instanceof Error ? err.message : String(err)}`, roleRecommendation: "Ensure Azure AD admin is set on the SQL server and the identity has VIEW DATABASE STATE permission." } };
+  }
+}
+
+// ─── RBAC Queries ────────────────────────────────────────────────────
+
+export interface RoleAssignmentInfo {
+  id: string;
+  principalId: string;
+  principalType: string;
+  roleDefinitionId: string;
+  roleDefinitionName: string;
+  scope: string;
+  createdOn: string;
+}
+
+export async function queryRoleAssignments(
+  subscriptionId: string,
+  scope?: string
+): Promise<{ assignments: RoleAssignmentInfo[]; totalCount: number; error?: AzureError }> {
+  try {
+    const scopeFilter = scope ? `| where properties.scope =~ '${scope}'` : "";
+    const query = `authorizationresources | where type == 'microsoft.authorization/roleassignments' ${scopeFilter} | project principalId = properties.principalId, principalType = properties.principalType, roleDefinitionId = properties.roleDefinitionId, scope = properties.scope, createdOn = properties.createdOn | take 1000`;
+    const result = await queryResourceGraph([subscriptionId], query);
+    if (result.error) return { assignments: [], totalCount: 0, error: result.error };
+    const assignments: RoleAssignmentInfo[] = result.resources.map((r) => ({
+      id: String(r["id"] ?? ""),
+      principalId: String(r["principalId"] ?? ""),
+      principalType: String(r["principalType"] ?? ""),
+      roleDefinitionId: String(r["roleDefinitionId"] ?? ""),
+      roleDefinitionName: String(r["roleDefinitionId"] ?? "").split("/").pop() ?? "",
+      scope: String(r["scope"] ?? ""),
+      createdOn: String(r["createdOn"] ?? ""),
+    }));
+    return { assignments, totalCount: result.totalRecords };
+  } catch (err) {
+    return { assignments: [], totalCount: 0, error: classifyError(err, "rbac") };
+  }
+}
+
+export async function queryCustomRoleDefinitions(
+  subscriptionId: string
+): Promise<{ roles: Array<{ id: string; name: string; roleName: string; description: string; permissions: number }>; totalCount: number; error?: AzureError }> {
+  try {
+    const query = `authorizationresources | where type == 'microsoft.authorization/roledefinitions' | where properties.type == 'CustomRole' | project id, name, roleName = properties.roleName, description = properties.description, permissions = array_length(properties.permissions) | take 500`;
+    const result = await queryResourceGraph([subscriptionId], query);
+    if (result.error) return { roles: [], totalCount: 0, error: result.error };
+    const roles = result.resources.map((r) => ({
+      id: String(r["id"] ?? ""), name: String(r["name"] ?? ""), roleName: String(r["roleName"] ?? ""),
+      description: String(r["description"] ?? ""), permissions: Number(r["permissions"] ?? 0),
+    }));
+    return { roles, totalCount: result.totalRecords };
+  } catch (err) {
+    return { roles: [], totalCount: 0, error: classifyError(err, "rbac") };
+  }
+}
+
+const RBAC_ERROR_CODES = [
+  "AuthorizationFailed", "LinkedAuthorizationFailed",
+  "RoleAssignmentLimitExceeded", "RoleDefinitionLimitExceeded",
+  "PrincipalNotFound", "RoleAssignmentUpdateNotPermitted",
+];
+
+export function getRecommendedRoleForOperation(operation: string): string {
+  const op = operation.toLowerCase();
+  const recommendations: Record<string, string> = {
+    "write": "Contributor", "delete": "Contributor", "action": "Contributor",
+    "roleassignments": "User Access Administrator", "locks": "Owner",
+    "policyassignments": "Resource Policy Contributor",
+  };
+  for (const [key, role] of Object.entries(recommendations)) {
+    if (op.includes(key)) return role;
+  }
+  return "Check your RBAC role assignments on the target scope.";
+}
+
+export async function queryRbacActivityFailures(
+  subscriptionId: string,
+  timespanHours: number = 24
+): Promise<{ failures: Array<{ time: string; operation: string; caller: string; errorCode: string; recommendation: string }>; error?: AzureError }> {
+  try {
+    const result = await getActivityLogs(subscriptionId, timespanHours);
+    if (result.error) return { failures: [], error: result.error };
+    const failures: Array<{ time: string; operation: string; caller: string; errorCode: string; recommendation: string }> = [];
+    for (const event of result.events) {
+      if (event.status?.value !== "Failed") continue;
+      const subStatus = event.subStatus?.value ?? "";
+      const statusMessage = (event.properties as Record<string, string> | undefined)?.statusMessage ?? "";
+      const op = event.operationName?.value ?? "";
+      const matchedCode = RBAC_ERROR_CODES.find((code) => subStatus.includes(code) || statusMessage.includes(code));
+      if (!matchedCode) continue;
+      let recommendation: string;
+      if (matchedCode === "AuthorizationFailed" || matchedCode === "LinkedAuthorizationFailed") {
+        recommendation = `Assign ${getRecommendedRoleForOperation(op)} at the resource group or resource scope.`;
+      } else if (matchedCode === "RoleAssignmentLimitExceeded") {
+        recommendation = "Approaching role assignment limit. Consolidate using group-based assignments.";
+      } else {
+        recommendation = `Review RBAC configuration. Error: ${matchedCode}`;
+      }
+      failures.push({ time: event.eventTimestamp?.toISOString() ?? "", operation: op, caller: event.caller ?? "", errorCode: matchedCode, recommendation });
+    }
+    return { failures };
+  } catch (err) {
+    return { failures: [], error: classifyError(err, "rbac") };
+  }
+}
+
 // ─── Concurrency Limiter ────────────────────────────────────────────
 
 export async function batchExecute<T>(

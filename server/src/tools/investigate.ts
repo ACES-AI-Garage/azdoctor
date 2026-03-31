@@ -11,6 +11,8 @@ import {
   discoverWorkspaces,
   queryLogAnalytics,
   getVmBootDiagnostics,
+  querySqlQueryStore,
+  getRecommendedRoleForOperation,
 } from "../utils/azure-client.js";
 import type { AzureError } from "../utils/azure-client.js";
 
@@ -182,12 +184,27 @@ export function registerInvestigate(server: McpServer): void {
           const status = event.status?.value ?? "";
           const op = event.operationName?.value ?? "";
           if (status === "Failed" || op.includes("write") || op.includes("deploy") || op.includes("restart") || op.includes("delete") || op.includes("action")) {
-            recentChanges.push({
+            const entry: Record<string, unknown> = {
               time: event.eventTimestamp?.toISOString(),
               operation: event.operationName?.localizedValue ?? op,
               status,
               caller: event.caller,
-            });
+            };
+
+            // Detect RBAC authorization failures
+            if (status === "Failed") {
+              const RBAC_CODES = ["AuthorizationFailed", "LinkedAuthorizationFailed", "RoleAssignmentLimitExceeded", "PrincipalNotFound"];
+              const subStatus = event.subStatus?.value ?? "";
+              const statusMessage = (event.properties as Record<string, string> | undefined)?.statusMessage ?? "";
+              const matchedCode = RBAC_CODES.find((code) => subStatus.includes(code) || statusMessage.includes(code));
+              if (matchedCode) {
+                entry.rbacError = true;
+                entry.errorCode = matchedCode;
+                entry.recommendedRole = getRecommendedRoleForOperation(op);
+              }
+            }
+
+            recentChanges.push(entry);
           }
         }
       }
@@ -554,7 +571,27 @@ export function registerInvestigate(server: McpServer): void {
         }
       }
 
-      // ── 8c. VM Boot Diagnostics ──────────────────────────────────────
+      // ── 8c. SQL Query Store (direct DMV access) ───────────────────────
+      let sqlQueryStoreInsights: Record<string, unknown> | null = null;
+
+      if (resourceType.toLowerCase() === "microsoft.sql/servers/databases" && resolvedRG) {
+        // Resolve the SQL server FQDN from the resource ID
+        const serverName = resourceId.match(/servers\/([^/]+)/)?.[1];
+        if (serverName) {
+          const serverFqdn = `${serverName}.database.windows.net`;
+          const dbName = resourceName.includes("/") ? resourceName.split("/").pop()! : resourceName;
+          const qsResult = await querySqlQueryStore(serverFqdn, dbName, effectiveHours);
+          if (qsResult.error) errors.push(qsResult.error);
+          if (qsResult.topQueries.length > 0) {
+            sqlQueryStoreInsights = {
+              source: "SQL Query Store (sys.query_store_*)",
+              topQueriesByCpu: qsResult.topQueries,
+            };
+          }
+        }
+      }
+
+      // ── 8d. VM Boot Diagnostics ──────────────────────────────────────
       // For VMs: detect potential boot failures from metrics/health and
       // automatically retrieve serial console log + instance view.
       let vmBootDiagnostics: Record<string, unknown> | null = null;
@@ -648,6 +685,11 @@ export function registerInvestigate(server: McpServer): void {
       // VM Boot Diagnostics (instance view, serial console log)
       if (vmBootDiagnostics) {
         response.vmBootDiagnostics = vmBootDiagnostics;
+      }
+
+      // SQL Query Store insights
+      if (sqlQueryStoreInsights) {
+        response.sqlQueryStoreInsights = sqlQueryStoreInsights;
       }
 
       // Dependencies
