@@ -870,9 +870,16 @@ export interface VmInstanceInfo {
   vmAgentVersion: string;
 }
 
+export interface BootErrorFinding {
+  pattern: string;
+  detail: string;
+  suggestedAction: string;
+}
+
 export interface VmBootDiagnosticsResult {
   instanceInfo: VmInstanceInfo;
   serialConsoleLog: string | null;
+  bootErrors: BootErrorFinding[];
   error?: AzureError;
 }
 
@@ -930,7 +937,10 @@ export async function getVmBootDiagnostics(
       // Boot diagnostics may not be enabled — not a fatal error
     }
 
-    return { instanceInfo, serialConsoleLog };
+    // Scan serial console log for known boot error patterns
+    const bootErrors = detectBootErrors(serialConsoleLog, instanceInfo);
+
+    return { instanceInfo, serialConsoleLog, bootErrors };
   } catch (err) {
     return {
       instanceInfo: {
@@ -940,7 +950,91 @@ export async function getVmBootDiagnostics(
         vmAgentVersion: "Unknown",
       },
       serialConsoleLog: null,
+      bootErrors: [],
       error: classifyError(err, "vmBootDiagnostics"),
     };
   }
+}
+
+function detectBootErrors(log: string | null, instanceInfo: VmInstanceInfo): BootErrorFinding[] {
+  const findings: BootErrorFinding[] = [];
+  const text = (log ?? "").toLowerCase();
+
+  // BCD corruption / boot config errors
+  if (text.includes("0xc000000f") || text.includes("boot configuration data") || /winload\.(exe|efi).*missing|missing.*winload/i.test(log ?? "")) {
+    findings.push({
+      pattern: "BCD corruption (0xc000000f)",
+      detail: "Boot Configuration Data is corrupted or pointing to a non-existent boot loader path.",
+      suggestedAction: "Create a repair VM, attach this VM's OS disk, and use bcdedit to fix the boot loader path (winload.efi).",
+    });
+  }
+
+  // Missing or corrupt winload
+  if (/\\[^\s]*winload/i.test(log ?? "") && (text.includes("missing") || text.includes("cannot be found") || text.includes("not found"))) {
+    const pathMatch = (log ?? "").match(/File:\s*([^\r\n]+)/i);
+    if (pathMatch && !findings.some((f) => f.pattern.includes("BCD"))) {
+      findings.push({
+        pattern: "Missing boot loader",
+        detail: `Boot loader path "${pathMatch[1].trim()}" does not exist or is corrupted.`,
+        suggestedAction: "Verify the file exists on the OS disk. If missing, repair BCD to point to the correct winload.efi path.",
+      });
+    }
+  }
+
+  // Blue screen / bug check
+  if (text.includes("bug check") || text.includes("stop code") || text.includes("blue screen") || /0x000000[0-9a-f]{2}/i.test(log ?? "")) {
+    const codeMatch = (log ?? "").match(/(0x[0-9A-Fa-f]{8,})/);
+    findings.push({
+      pattern: "Blue screen (BSOD)",
+      detail: `Blue screen error detected${codeMatch ? `: stop code ${codeMatch[1]}` : ""}.`,
+      suggestedAction: "Check for recent driver updates or OS patches. Boot into safe mode or use a repair VM to investigate.",
+    });
+  }
+
+  // Inaccessible boot device
+  if (text.includes("inaccessible_boot_device") || text.includes("inaccessible boot device")) {
+    findings.push({
+      pattern: "Inaccessible boot device",
+      detail: "The OS cannot access the boot disk. This may be caused by disk encryption, driver issues, or disk corruption.",
+      suggestedAction: "Check if disk encryption (BitLocker/ADE) is enabled. Verify disk is attached correctly. Try attaching to a repair VM.",
+    });
+  }
+
+  // Kernel panic (Linux)
+  if (text.includes("kernel panic") || text.includes("not syncing")) {
+    findings.push({
+      pattern: "Kernel panic",
+      detail: "Linux kernel panic — the OS encountered an unrecoverable error during boot.",
+      suggestedAction: "Check for recent kernel updates. Boot with a previous kernel version or use a repair VM to inspect /var/log/.",
+    });
+  }
+
+  // GRUB errors (Linux)
+  if (text.includes("grub") && (text.includes("error") || text.includes("not found") || text.includes("unknown filesystem"))) {
+    findings.push({
+      pattern: "GRUB boot loader error",
+      detail: "GRUB cannot find the boot partition or filesystem. Boot configuration may be corrupted.",
+      suggestedAction: "Attach OS disk to a repair VM and rebuild GRUB configuration (grub-install, update-grub).",
+    });
+  }
+
+  // fstab errors (Linux)
+  if (text.includes("mount") && (text.includes("failed") || text.includes("does not exist")) && text.includes("fstab")) {
+    findings.push({
+      pattern: "fstab mount failure",
+      detail: "A filesystem entry in /etc/fstab failed to mount, preventing boot completion.",
+      suggestedAction: "Attach OS disk to a repair VM and fix /etc/fstab — comment out or correct the failing mount entry.",
+    });
+  }
+
+  // VM Agent not ready combined with low CPU — likely OS not booting
+  if (instanceInfo.vmAgentStatus === "Not reporting" && instanceInfo.powerState.includes("running")) {
+    findings.push({
+      pattern: "VM running but guest OS unresponsive",
+      detail: "VM is powered on but the VM agent is not reporting. The guest OS may not have booted successfully.",
+      suggestedAction: "Check the serial console log for boot errors. If no log is available, enable boot diagnostics and restart the VM.",
+    });
+  }
+
+  return findings;
 }

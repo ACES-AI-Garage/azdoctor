@@ -687,12 +687,13 @@ ${resourceFilter}
           possibleBootFailure,
         };
 
+        // Include detected boot error patterns — structured findings from the serial console log
+        if (bootDiag.bootErrors.length > 0) {
+          (vmBootDiagnostics as Record<string, unknown>).detectedBootErrors = bootDiag.bootErrors;
+        }
+
         if (possibleBootFailure && bootDiag.serialConsoleLog) {
           (vmBootDiagnostics as Record<string, unknown>).serialConsoleLog = bootDiag.serialConsoleLog;
-          (vmBootDiagnostics as Record<string, unknown>).note =
-            "Serial console log retrieved because boot failure indicators were detected " +
-            "(Available Memory at 0%, low CPU, or Resource Health unhealthy). " +
-            "Check the log for Windows boot errors such as BCD corruption, missing winload.efi, or blue-screen codes.";
         } else if (possibleBootFailure && !bootDiag.serialConsoleLog) {
           (vmBootDiagnostics as Record<string, unknown>).serialConsoleLog = null;
           (vmBootDiagnostics as Record<string, unknown>).note =

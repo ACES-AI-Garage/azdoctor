@@ -55873,7 +55873,8 @@ async function getVmBootDiagnostics(subscriptionId, resourceGroup, vmName) {
       }
     } catch {
     }
-    return { instanceInfo, serialConsoleLog };
+    const bootErrors = detectBootErrors(serialConsoleLog, instanceInfo);
+    return { instanceInfo, serialConsoleLog, bootErrors };
   } catch (err) {
     return {
       instanceInfo: {
@@ -55883,9 +55884,75 @@ async function getVmBootDiagnostics(subscriptionId, resourceGroup, vmName) {
         vmAgentVersion: "Unknown"
       },
       serialConsoleLog: null,
+      bootErrors: [],
       error: classifyError(err, "vmBootDiagnostics")
     };
   }
+}
+function detectBootErrors(log, instanceInfo) {
+  const findings = [];
+  const text = (log ?? "").toLowerCase();
+  if (text.includes("0xc000000f") || text.includes("boot configuration data") || /winload\.(exe|efi).*missing|missing.*winload/i.test(log ?? "")) {
+    findings.push({
+      pattern: "BCD corruption (0xc000000f)",
+      detail: "Boot Configuration Data is corrupted or pointing to a non-existent boot loader path.",
+      suggestedAction: "Create a repair VM, attach this VM's OS disk, and use bcdedit to fix the boot loader path (winload.efi)."
+    });
+  }
+  if (/\\[^\s]*winload/i.test(log ?? "") && (text.includes("missing") || text.includes("cannot be found") || text.includes("not found"))) {
+    const pathMatch = (log ?? "").match(/File:\s*([^\r\n]+)/i);
+    if (pathMatch && !findings.some((f) => f.pattern.includes("BCD"))) {
+      findings.push({
+        pattern: "Missing boot loader",
+        detail: `Boot loader path "${pathMatch[1].trim()}" does not exist or is corrupted.`,
+        suggestedAction: "Verify the file exists on the OS disk. If missing, repair BCD to point to the correct winload.efi path."
+      });
+    }
+  }
+  if (text.includes("bug check") || text.includes("stop code") || text.includes("blue screen") || /0x000000[0-9a-f]{2}/i.test(log ?? "")) {
+    const codeMatch = (log ?? "").match(/(0x[0-9A-Fa-f]{8,})/);
+    findings.push({
+      pattern: "Blue screen (BSOD)",
+      detail: `Blue screen error detected${codeMatch ? `: stop code ${codeMatch[1]}` : ""}.`,
+      suggestedAction: "Check for recent driver updates or OS patches. Boot into safe mode or use a repair VM to investigate."
+    });
+  }
+  if (text.includes("inaccessible_boot_device") || text.includes("inaccessible boot device")) {
+    findings.push({
+      pattern: "Inaccessible boot device",
+      detail: "The OS cannot access the boot disk. This may be caused by disk encryption, driver issues, or disk corruption.",
+      suggestedAction: "Check if disk encryption (BitLocker/ADE) is enabled. Verify disk is attached correctly. Try attaching to a repair VM."
+    });
+  }
+  if (text.includes("kernel panic") || text.includes("not syncing")) {
+    findings.push({
+      pattern: "Kernel panic",
+      detail: "Linux kernel panic \u2014 the OS encountered an unrecoverable error during boot.",
+      suggestedAction: "Check for recent kernel updates. Boot with a previous kernel version or use a repair VM to inspect /var/log/."
+    });
+  }
+  if (text.includes("grub") && (text.includes("error") || text.includes("not found") || text.includes("unknown filesystem"))) {
+    findings.push({
+      pattern: "GRUB boot loader error",
+      detail: "GRUB cannot find the boot partition or filesystem. Boot configuration may be corrupted.",
+      suggestedAction: "Attach OS disk to a repair VM and rebuild GRUB configuration (grub-install, update-grub)."
+    });
+  }
+  if (text.includes("mount") && (text.includes("failed") || text.includes("does not exist")) && text.includes("fstab")) {
+    findings.push({
+      pattern: "fstab mount failure",
+      detail: "A filesystem entry in /etc/fstab failed to mount, preventing boot completion.",
+      suggestedAction: "Attach OS disk to a repair VM and fix /etc/fstab \u2014 comment out or correct the failing mount entry."
+    });
+  }
+  if (instanceInfo.vmAgentStatus === "Not reporting" && instanceInfo.powerState.includes("running")) {
+    findings.push({
+      pattern: "VM running but guest OS unresponsive",
+      detail: "VM is powered on but the VM agent is not reporting. The guest OS may not have booted successfully.",
+      suggestedAction: "Check the serial console log for boot errors. If no log is available, enable boot diagnostics and restart the VM."
+    });
+  }
+  return findings;
 }
 
 // src/tools/healthcheck.ts
@@ -56642,9 +56709,11 @@ ${resourceFilter}
           instanceInfo: bootDiag.instanceInfo,
           possibleBootFailure
         };
+        if (bootDiag.bootErrors.length > 0) {
+          vmBootDiagnostics.detectedBootErrors = bootDiag.bootErrors;
+        }
         if (possibleBootFailure && bootDiag.serialConsoleLog) {
           vmBootDiagnostics.serialConsoleLog = bootDiag.serialConsoleLog;
-          vmBootDiagnostics.note = "Serial console log retrieved because boot failure indicators were detected (Available Memory at 0%, low CPU, or Resource Health unhealthy). Check the log for Windows boot errors such as BCD corruption, missing winload.efi, or blue-screen codes.";
         } else if (possibleBootFailure && !bootDiag.serialConsoleLog) {
           vmBootDiagnostics.serialConsoleLog = null;
           vmBootDiagnostics.note = "Boot failure indicators detected but serial console log is unavailable. Ensure boot diagnostics are enabled on the VM (az vm boot-diagnostics enable).";
