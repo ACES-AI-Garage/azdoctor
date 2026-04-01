@@ -35,8 +35,23 @@ const AVAILABLE_ACTIONS: RemediationAction[] = [
     description: "Restart the resource. Causes brief downtime.",
     risk: "low",
     reversible: true,
-    applicableTo: ["microsoft.web/sites", "microsoft.cache/redis"],
+    applicableTo: ["microsoft.web/sites", "microsoft.cache/redis", "microsoft.compute/virtualmachines"],
     warning: "Causes 10-30 seconds of downtime during restart.",
+  },
+  {
+    action: "deallocate",
+    description: "Deallocate the VM (stop and release compute resources). Stops billing.",
+    risk: "high",
+    reversible: true,
+    applicableTo: ["microsoft.compute/virtualmachines"],
+    warning: "VM will be fully stopped and deallocated. Dynamic public IP will be released. Use 'az vm start' to restart.",
+  },
+  {
+    action: "start",
+    description: "Start a stopped/deallocated VM.",
+    risk: "low",
+    reversible: true,
+    applicableTo: ["microsoft.compute/virtualmachines"],
   },
   {
     action: "scale_up",
@@ -170,11 +185,60 @@ function executeRestart(
     };
   }
 
+  if (normalizedType === "microsoft.compute/virtualmachines") {
+    const result = executeAzCommand(
+      `az vm restart --name ${resourceName} --resource-group ${resourceGroup} --subscription ${subscription}`,
+      120000 // VMs can take up to 2 minutes to restart
+    );
+    return {
+      ...result,
+      rollbackHint: "No rollback needed — VM will recover automatically after restart.",
+    };
+  }
+
   return {
     success: false,
     output: "",
     error: `Restart is not supported for resource type '${resourceType}'.`,
     rollbackHint: "",
+  };
+}
+
+function executeDeallocate(
+  resourceType: string,
+  resourceName: string,
+  resourceGroup: string,
+  subscription: string
+): { success: boolean; output: string; error?: string; rollbackHint: string } {
+  if (resourceType.toLowerCase() !== "microsoft.compute/virtualmachines") {
+    return { success: false, output: "", error: `Deallocate is only supported for VMs.`, rollbackHint: "" };
+  }
+  const result = executeAzCommand(
+    `az vm deallocate --name ${resourceName} --resource-group ${resourceGroup} --subscription ${subscription}`,
+    180000
+  );
+  return {
+    ...result,
+    rollbackHint: `To restart: az vm start --name ${resourceName} --resource-group ${resourceGroup} --subscription ${subscription}`,
+  };
+}
+
+function executeStart(
+  resourceType: string,
+  resourceName: string,
+  resourceGroup: string,
+  subscription: string
+): { success: boolean; output: string; error?: string; rollbackHint: string } {
+  if (resourceType.toLowerCase() !== "microsoft.compute/virtualmachines") {
+    return { success: false, output: "", error: `Start is only supported for VMs.`, rollbackHint: "" };
+  }
+  const result = executeAzCommand(
+    `az vm start --name ${resourceName} --resource-group ${resourceGroup} --subscription ${subscription}`,
+    180000
+  );
+  return {
+    ...result,
+    rollbackHint: `To stop: az vm deallocate --name ${resourceName} --resource-group ${resourceGroup} --subscription ${subscription}`,
   };
 }
 
@@ -401,6 +465,8 @@ export function registerRemediate(server: McpServer): void {
           "scale_out",
           "failover",
           "flush_cache",
+          "deallocate",
+          "start",
           "list_actions",
         ])
         .describe("Remediation action to execute"),
@@ -683,6 +749,22 @@ export function registerRemediate(server: McpServer): void {
           break;
         case "flush_cache":
           execResult = executeFlushCache(
+            resourceType,
+            resourceName,
+            resolvedResourceGroup,
+            resolvedSubscription
+          );
+          break;
+        case "deallocate":
+          execResult = executeDeallocate(
+            resourceType,
+            resourceName,
+            resolvedResourceGroup,
+            resolvedSubscription
+          );
+          break;
+        case "start":
+          execResult = executeStart(
             resourceType,
             resourceName,
             resolvedResourceGroup,

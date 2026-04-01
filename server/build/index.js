@@ -57109,8 +57109,23 @@ var AVAILABLE_ACTIONS = [
     description: "Restart the resource. Causes brief downtime.",
     risk: "low",
     reversible: true,
-    applicableTo: ["microsoft.web/sites", "microsoft.cache/redis"],
+    applicableTo: ["microsoft.web/sites", "microsoft.cache/redis", "microsoft.compute/virtualmachines"],
     warning: "Causes 10-30 seconds of downtime during restart."
+  },
+  {
+    action: "deallocate",
+    description: "Deallocate the VM (stop and release compute resources). Stops billing.",
+    risk: "high",
+    reversible: true,
+    applicableTo: ["microsoft.compute/virtualmachines"],
+    warning: "VM will be fully stopped and deallocated. Dynamic public IP will be released. Use 'az vm start' to restart."
+  },
+  {
+    action: "start",
+    description: "Start a stopped/deallocated VM.",
+    risk: "low",
+    reversible: true,
+    applicableTo: ["microsoft.compute/virtualmachines"]
   },
   {
     action: "scale_up",
@@ -57218,11 +57233,48 @@ function executeRestart(resourceType, resourceName, resourceGroup, subscription)
       rollbackHint: "No rollback needed \u2014 Redis will recover automatically after reboot."
     };
   }
+  if (normalizedType === "microsoft.compute/virtualmachines") {
+    const result = executeAzCommand(
+      `az vm restart --name ${resourceName} --resource-group ${resourceGroup} --subscription ${subscription}`,
+      12e4
+      // VMs can take up to 2 minutes to restart
+    );
+    return {
+      ...result,
+      rollbackHint: "No rollback needed \u2014 VM will recover automatically after restart."
+    };
+  }
   return {
     success: false,
     output: "",
     error: `Restart is not supported for resource type '${resourceType}'.`,
     rollbackHint: ""
+  };
+}
+function executeDeallocate(resourceType, resourceName, resourceGroup, subscription) {
+  if (resourceType.toLowerCase() !== "microsoft.compute/virtualmachines") {
+    return { success: false, output: "", error: `Deallocate is only supported for VMs.`, rollbackHint: "" };
+  }
+  const result = executeAzCommand(
+    `az vm deallocate --name ${resourceName} --resource-group ${resourceGroup} --subscription ${subscription}`,
+    18e4
+  );
+  return {
+    ...result,
+    rollbackHint: `To restart: az vm start --name ${resourceName} --resource-group ${resourceGroup} --subscription ${subscription}`
+  };
+}
+function executeStart(resourceType, resourceName, resourceGroup, subscription) {
+  if (resourceType.toLowerCase() !== "microsoft.compute/virtualmachines") {
+    return { success: false, output: "", error: `Start is only supported for VMs.`, rollbackHint: "" };
+  }
+  const result = executeAzCommand(
+    `az vm start --name ${resourceName} --resource-group ${resourceGroup} --subscription ${subscription}`,
+    18e4
+  );
+  return {
+    ...result,
+    rollbackHint: `To stop: az vm deallocate --name ${resourceName} --resource-group ${resourceGroup} --subscription ${subscription}`
   };
 }
 function executeScaleUp(resourceType, resourceName, resourceGroup, subscription, scaleTarget, resourceId) {
@@ -57376,6 +57428,8 @@ function registerRemediate(server2) {
         "scale_out",
         "failover",
         "flush_cache",
+        "deallocate",
+        "start",
         "list_actions"
       ]).describe("Remediation action to execute"),
       dryRun: external_exports.boolean().default(true).describe(
@@ -57596,6 +57650,22 @@ function registerRemediate(server2) {
           break;
         case "flush_cache":
           execResult = executeFlushCache(
+            resourceType,
+            resourceName,
+            resolvedResourceGroup,
+            resolvedSubscription
+          );
+          break;
+        case "deallocate":
+          execResult = executeDeallocate(
+            resourceType,
+            resourceName,
+            resolvedResourceGroup,
+            resolvedSubscription
+          );
+          break;
+        case "start":
+          execResult = executeStart(
             resourceType,
             resourceName,
             resolvedResourceGroup,
