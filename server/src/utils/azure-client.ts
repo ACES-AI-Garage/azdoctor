@@ -705,6 +705,145 @@ export async function queryRbacActivityFailures(
   }
 }
 
+// ─── Kubectl ────────────────────────────────────────────────────────
+
+export interface KubectlResult {
+  data: unknown;
+  error?: AzureError;
+}
+
+/**
+ * Get AKS credentials and run a kubectl command, returning parsed JSON.
+ * Automatically fetches kubeconfig for the cluster if needed.
+ */
+export async function runKubectl(
+  subscriptionId: string,
+  resourceGroup: string,
+  clusterName: string,
+  command: string
+): Promise<KubectlResult> {
+  try {
+    // Get credentials (merges into kubeconfig)
+    execSync(
+      `az aks get-credentials --subscription ${subscriptionId} --resource-group ${resourceGroup} --name ${clusterName} --overwrite-existing`,
+      { encoding: "utf-8", timeout: 30000, stdio: ["pipe", "pipe", "pipe"] }
+    );
+
+    // Run kubectl command with JSON output
+    const output = execSync(`kubectl ${command} -o json`, {
+      encoding: "utf-8",
+      timeout: 15000,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    return { data: JSON.parse(output) };
+  } catch (err) {
+    return {
+      data: null,
+      error: {
+        code: "KUBECTL_ERROR",
+        message: `kubectl failed: ${err instanceof Error ? err.message : String(err)}`,
+      },
+    };
+  }
+}
+
+/**
+ * Get pod details for AKS investigation — env vars, resource limits,
+ * restart reasons, container status.
+ */
+export async function getAksPodDiagnostics(
+  subscriptionId: string,
+  resourceGroup: string,
+  clusterName: string
+): Promise<{
+  pods: Array<{
+    name: string;
+    namespace: string;
+    status: string;
+    restarts: number;
+    exitCode: number | null;
+    reason: string | null;
+    memoryLimit: string | null;
+    memoryRequest: string | null;
+    cpuLimit: string | null;
+    cpuRequest: string | null;
+    envDatabaseRefs: string[];
+  }>;
+  error?: AzureError;
+}> {
+  try {
+    const podsResult = await runKubectl(
+      subscriptionId, resourceGroup, clusterName,
+      "get pods --all-namespaces"
+    );
+    if (podsResult.error) return { pods: [], error: podsResult.error };
+
+    const podList = podsResult.data as {
+      items: Array<{
+        metadata: { name: string; namespace: string };
+        status: {
+          phase: string;
+          containerStatuses?: Array<{
+            name: string;
+            restartCount: number;
+            lastState?: { terminated?: { exitCode: number; reason: string } };
+          }>;
+        };
+        spec: {
+          containers: Array<{
+            name: string;
+            resources?: { limits?: { memory?: string; cpu?: string }; requests?: { memory?: string; cpu?: string } };
+            env?: Array<{ name: string; value?: string }>;
+          }>;
+        };
+      }>;
+    };
+
+    // Filter to non-system pods
+    const userPods = (podList.items ?? []).filter(
+      (p) => !p.metadata.namespace.startsWith("kube-") && p.metadata.namespace !== "gatekeeper-system"
+    );
+
+    const pods = userPods.map((pod) => {
+      const container = pod.spec.containers[0];
+      const containerStatus = pod.status.containerStatuses?.[0];
+
+      // Find database-related env vars
+      const envDatabaseRefs: string[] = [];
+      for (const env of container?.env ?? []) {
+        const val = env.value ?? "";
+        if (/PG_|POSTGRES|DATABASE|SQL|REDIS|COSMOS|MONGO/i.test(env.name) && val) {
+          envDatabaseRefs.push(`${env.name}=${val}`);
+        } else if (/\.database\.windows\.net|\.postgres\.database\.azure\.com|\.redis\.cache\.windows\.net|\.documents\.azure\.com|\.mongo\.cosmos\.azure\.com/i.test(val)) {
+          envDatabaseRefs.push(`${env.name}=${val}`);
+        }
+      }
+
+      return {
+        name: pod.metadata.name,
+        namespace: pod.metadata.namespace,
+        status: pod.status.phase,
+        restarts: containerStatus?.restartCount ?? 0,
+        exitCode: containerStatus?.lastState?.terminated?.exitCode ?? null,
+        reason: containerStatus?.lastState?.terminated?.reason ?? null,
+        memoryLimit: container?.resources?.limits?.memory ?? null,
+        memoryRequest: container?.resources?.requests?.memory ?? null,
+        cpuLimit: container?.resources?.limits?.cpu ?? null,
+        cpuRequest: container?.resources?.requests?.cpu ?? null,
+        envDatabaseRefs,
+      };
+    });
+
+    return { pods };
+  } catch (err) {
+    return {
+      pods: [],
+      error: { code: "AKS_POD_DIAG_ERROR", message: `Failed: ${err instanceof Error ? err.message : String(err)}` },
+    };
+  }
+}
+
 // ─── Concurrency Limiter ────────────────────────────────────────────
 
 export async function batchExecute<T>(

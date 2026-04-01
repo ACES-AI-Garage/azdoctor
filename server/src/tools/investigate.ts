@@ -13,6 +13,7 @@ import {
   getVmBootDiagnostics,
   querySqlQueryStore,
   getRecommendedRoleForOperation,
+  getAksPodDiagnostics,
 } from "../utils/azure-client.js";
 import type { AzureError } from "../utils/azure-client.js";
 
@@ -364,11 +365,13 @@ export function registerInvestigate(server: McpServer): void {
             }
           }
         } else {
-          // For non-App Service resources: find data/compute resources in the same RG
+          // For non-App Service resources: find data services in the same RG
+          // Only show databases, caches, storage, key vaults — not other compute
+          // resources (App Services, VMs, other AKS clusters) which are unrelated
           const depQuery = `Resources
 | where resourceGroup =~ '${resolvedRG}'
 | where name != '${resourceName}'
-| where type in~ ('microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.web/sites', 'microsoft.compute/virtualmachines', 'microsoft.containerservice/managedclusters')
+| where type in~ ('microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.dbforpostgresql/flexibleservers', 'microsoft.dbformysql/flexibleservers')
 | where name != 'master'
 | project id, name, type
 | take 10`;
@@ -533,6 +536,56 @@ ${resourceFilter}
             if (podStatus.error) errors.push(podStatus.error);
             if (oomKills.error) errors.push(oomKills.error);
             if (containerRestarts.error) errors.push(containerRestarts.error);
+
+            // Also get live pod data via kubectl — resource limits, env vars, restart details
+            if (resolvedRG) {
+              const kubeDiag = await getAksPodDiagnostics(subscription, resolvedRG, resourceName);
+              if (kubeDiag.error) {
+                errors.push(kubeDiag.error);
+              } else if (kubeDiag.pods.length > 0) {
+                (resourceSpecificLogs as Record<string, unknown>).podDetails = kubeDiag.pods.map((p) => ({
+                  name: p.name,
+                  namespace: p.namespace,
+                  status: p.status,
+                  restarts: p.restarts,
+                  lastExitCode: p.exitCode,
+                  lastExitReason: p.reason,
+                  memoryLimit: p.memoryLimit,
+                  memoryRequest: p.memoryRequest,
+                  cpuLimit: p.cpuLimit,
+                  cpuRequest: p.cpuRequest,
+                  databaseConnections: p.envDatabaseRefs.length > 0 ? p.envDatabaseRefs : undefined,
+                }));
+
+                // Use env vars to discover actual database dependencies
+                const dbHosts = new Set<string>();
+                for (const pod of kubeDiag.pods) {
+                  for (const ref of pod.envDatabaseRefs) {
+                    const host = ref.match(/(?:=)([^.]+)\.(?:postgres|database|redis|documents|mongo)/i);
+                    if (host) dbHosts.add(host[1].toLowerCase());
+                  }
+                }
+                if (dbHosts.size > 0) {
+                  // Override the generic RG-based dependency discovery with actual refs
+                  const nameFilter = Array.from(dbHosts).map((n) => `name =~ '${n}'`).join(" or ");
+                  const refQuery = `Resources | where (${nameFilter}) | project id, name, type | take 10`;
+                  const refResult = await queryResourceGraph([subscription], refQuery);
+                  if (!refResult.error && refResult.resources.length > 0) {
+                    // Clear generic deps and replace with kubectl-discovered ones
+                    dependencies.length = 0;
+                    const kubeDeps = await batchExecute(
+                      refResult.resources.map((dep) => async () => {
+                        const h = await getResourceHealth(subscription, dep.id as string);
+                        const health = h.statuses[0]?.properties?.availabilityState ?? "Unknown";
+                        return health !== "Unknown" ? { name: dep.name as string, type: dep.type as string, health, relationship: "referenced in pod env vars" } : null;
+                      }),
+                      5
+                    );
+                    dependencies.push(...kubeDeps.filter((d): d is NonNullable<typeof d> => d !== null));
+                  }
+                }
+              }
+            }
 
           } else if (typeLower.includes("microsoft.sql/") || typeLower.includes("microsoft.dbforpostgresql/")) {
             // SQL / PostgreSQL diagnostic queries

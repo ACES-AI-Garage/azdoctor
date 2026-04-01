@@ -55763,6 +55763,75 @@ async function queryRbacActivityFailures(subscriptionId, timespanHours = 24) {
     return { failures: [], error: classifyError(err, "rbac") };
   }
 }
+async function runKubectl(subscriptionId, resourceGroup, clusterName, command) {
+  try {
+    execSync(
+      `az aks get-credentials --subscription ${subscriptionId} --resource-group ${resourceGroup} --name ${clusterName} --overwrite-existing`,
+      { encoding: "utf-8", timeout: 3e4, stdio: ["pipe", "pipe", "pipe"] }
+    );
+    const output = execSync(`kubectl ${command} -o json`, {
+      encoding: "utf-8",
+      timeout: 15e3,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    return { data: JSON.parse(output) };
+  } catch (err) {
+    return {
+      data: null,
+      error: {
+        code: "KUBECTL_ERROR",
+        message: `kubectl failed: ${err instanceof Error ? err.message : String(err)}`
+      }
+    };
+  }
+}
+async function getAksPodDiagnostics(subscriptionId, resourceGroup, clusterName) {
+  try {
+    const podsResult = await runKubectl(
+      subscriptionId,
+      resourceGroup,
+      clusterName,
+      "get pods --all-namespaces"
+    );
+    if (podsResult.error) return { pods: [], error: podsResult.error };
+    const podList = podsResult.data;
+    const userPods = (podList.items ?? []).filter(
+      (p) => !p.metadata.namespace.startsWith("kube-") && p.metadata.namespace !== "gatekeeper-system"
+    );
+    const pods = userPods.map((pod) => {
+      const container = pod.spec.containers[0];
+      const containerStatus = pod.status.containerStatuses?.[0];
+      const envDatabaseRefs = [];
+      for (const env of container?.env ?? []) {
+        const val = env.value ?? "";
+        if (/PG_|POSTGRES|DATABASE|SQL|REDIS|COSMOS|MONGO/i.test(env.name) && val) {
+          envDatabaseRefs.push(`${env.name}=${val}`);
+        } else if (/\.database\.windows\.net|\.postgres\.database\.azure\.com|\.redis\.cache\.windows\.net|\.documents\.azure\.com|\.mongo\.cosmos\.azure\.com/i.test(val)) {
+          envDatabaseRefs.push(`${env.name}=${val}`);
+        }
+      }
+      return {
+        name: pod.metadata.name,
+        namespace: pod.metadata.namespace,
+        status: pod.status.phase,
+        restarts: containerStatus?.restartCount ?? 0,
+        exitCode: containerStatus?.lastState?.terminated?.exitCode ?? null,
+        reason: containerStatus?.lastState?.terminated?.reason ?? null,
+        memoryLimit: container?.resources?.limits?.memory ?? null,
+        memoryRequest: container?.resources?.requests?.memory ?? null,
+        cpuLimit: container?.resources?.limits?.cpu ?? null,
+        cpuRequest: container?.resources?.requests?.cpu ?? null,
+        envDatabaseRefs
+      };
+    });
+    return { pods };
+  } catch (err) {
+    return {
+      pods: [],
+      error: { code: "AKS_POD_DIAG_ERROR", message: `Failed: ${err instanceof Error ? err.message : String(err)}` }
+    };
+  }
+}
 async function batchExecute(tasks, batchSize = 5) {
   const results = [];
   for (let i = 0; i < tasks.length; i += batchSize) {
@@ -56300,7 +56369,7 @@ function registerInvestigate(server2) {
           const depQuery = `Resources
 | where resourceGroup =~ '${resolvedRG}'
 | where name != '${resourceName}'
-| where type in~ ('microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.web/sites', 'microsoft.compute/virtualmachines', 'microsoft.containerservice/managedclusters')
+| where type in~ ('microsoft.sql/servers/databases', 'microsoft.documentdb/databaseaccounts', 'microsoft.cache/redis', 'microsoft.storage/storageaccounts', 'microsoft.keyvault/vaults', 'microsoft.dbforpostgresql/flexibleservers', 'microsoft.dbformysql/flexibleservers')
 | where name != 'master'
 | project id, name, type
 | take 10`;
@@ -56448,6 +56517,50 @@ ${resourceFilter}
             if (podStatus.error) errors.push(podStatus.error);
             if (oomKills.error) errors.push(oomKills.error);
             if (containerRestarts.error) errors.push(containerRestarts.error);
+            if (resolvedRG) {
+              const kubeDiag = await getAksPodDiagnostics(subscription, resolvedRG, resourceName);
+              if (kubeDiag.error) {
+                errors.push(kubeDiag.error);
+              } else if (kubeDiag.pods.length > 0) {
+                resourceSpecificLogs.podDetails = kubeDiag.pods.map((p) => ({
+                  name: p.name,
+                  namespace: p.namespace,
+                  status: p.status,
+                  restarts: p.restarts,
+                  lastExitCode: p.exitCode,
+                  lastExitReason: p.reason,
+                  memoryLimit: p.memoryLimit,
+                  memoryRequest: p.memoryRequest,
+                  cpuLimit: p.cpuLimit,
+                  cpuRequest: p.cpuRequest,
+                  databaseConnections: p.envDatabaseRefs.length > 0 ? p.envDatabaseRefs : void 0
+                }));
+                const dbHosts = /* @__PURE__ */ new Set();
+                for (const pod of kubeDiag.pods) {
+                  for (const ref of pod.envDatabaseRefs) {
+                    const host = ref.match(/(?:=)([^.]+)\.(?:postgres|database|redis|documents|mongo)/i);
+                    if (host) dbHosts.add(host[1].toLowerCase());
+                  }
+                }
+                if (dbHosts.size > 0) {
+                  const nameFilter = Array.from(dbHosts).map((n) => `name =~ '${n}'`).join(" or ");
+                  const refQuery = `Resources | where (${nameFilter}) | project id, name, type | take 10`;
+                  const refResult = await queryResourceGraph([subscription], refQuery);
+                  if (!refResult.error && refResult.resources.length > 0) {
+                    dependencies.length = 0;
+                    const kubeDeps = await batchExecute(
+                      refResult.resources.map((dep) => async () => {
+                        const h = await getResourceHealth(subscription, dep.id);
+                        const health = h.statuses[0]?.properties?.availabilityState ?? "Unknown";
+                        return health !== "Unknown" ? { name: dep.name, type: dep.type, health, relationship: "referenced in pod env vars" } : null;
+                      }),
+                      5
+                    );
+                    dependencies.push(...kubeDeps.filter((d) => d !== null));
+                  }
+                }
+              }
+            }
           } else if (typeLower.includes("microsoft.sql/") || typeLower.includes("microsoft.dbforpostgresql/")) {
             const [queryStats, waitStats, deadlocks] = await Promise.all([
               queryLogAnalytics(wsId, `AzureDiagnostics
