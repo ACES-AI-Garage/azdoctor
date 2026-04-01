@@ -56115,12 +56115,14 @@ function registerInvestigate(server2) {
         });
         parentMetricNames = parentSorted.slice(0, MAX_METRICS).map((d) => d.name);
       }
+      const FINE_GRAIN_TYPES = ["microsoft.web/sites", "microsoft.web/serverfarms", "microsoft.sql/servers/databases", "microsoft.compute/virtualmachines", "microsoft.containerservice/managedclusters", "microsoft.cache/redis"];
+      const granularity = FINE_GRAIN_TYPES.includes(resourceType.toLowerCase()) ? "PT5M" : "PT1H";
       const metricPromises = [];
       if (selectedMetrics.length > 0) {
         metricPromises.push({
           label: resourceName,
           resourceId,
-          promise: getMetrics(resourceId, selectedMetrics, effectiveHours, "PT5M")
+          promise: getMetrics(resourceId, selectedMetrics, effectiveHours, granularity)
         });
       }
       if (parentResourceId && parentMetricNames.length > 0) {
@@ -56128,6 +56130,7 @@ function registerInvestigate(server2) {
           label: `${parentLabel ?? "parent"}`,
           resourceId: parentResourceId,
           promise: getMetrics(parentResourceId, parentMetricNames, effectiveHours, "PT5M")
+          // Plans always support PT5M
         });
       }
       const [healthResult, activityResult, ...metricResults] = await Promise.all([

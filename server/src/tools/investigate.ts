@@ -133,13 +133,18 @@ export function registerInvestigate(server: McpServer): void {
       }
 
       // ── 3. Gather ALL signals in parallel ────────────────────────────
+      // Some resource types (e.g., PostgreSQL Flexible Server) only support
+      // coarser time grains. Use PT1H as a safe default, PT5M for common types.
+      const FINE_GRAIN_TYPES = ["microsoft.web/sites", "microsoft.web/serverfarms", "microsoft.sql/servers/databases", "microsoft.compute/virtualmachines", "microsoft.containerservice/managedclusters", "microsoft.cache/redis"];
+      const granularity = FINE_GRAIN_TYPES.includes(resourceType.toLowerCase()) ? "PT5M" : "PT1H";
+
       const metricPromises: Array<{ label: string; resourceId: string; promise: ReturnType<typeof getMetrics> }> = [];
 
       if (selectedMetrics.length > 0) {
         metricPromises.push({
           label: resourceName,
           resourceId,
-          promise: getMetrics(resourceId, selectedMetrics, effectiveHours, "PT5M"),
+          promise: getMetrics(resourceId, selectedMetrics, effectiveHours, granularity),
         });
       }
 
@@ -147,7 +152,7 @@ export function registerInvestigate(server: McpServer): void {
         metricPromises.push({
           label: `${parentLabel ?? "parent"}`,
           resourceId: parentResourceId,
-          promise: getMetrics(parentResourceId, parentMetricNames, effectiveHours, "PT5M"),
+          promise: getMetrics(parentResourceId, parentMetricNames, effectiveHours, "PT5M"), // Plans always support PT5M
         });
       }
 
