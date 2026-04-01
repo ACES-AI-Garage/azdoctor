@@ -1027,12 +1027,14 @@ function detectBootErrors(log: string | null, instanceInfo: VmInstanceInfo): Boo
     });
   }
 
-  // VM Agent not ready combined with low CPU — likely OS not booting
-  if (instanceInfo.vmAgentStatus === "Not reporting" && instanceInfo.powerState.includes("running")) {
+  // VM Agent not ready — only add this if no specific boot error was already found
+  if (instanceInfo.vmAgentStatus === "Not reporting" && instanceInfo.powerState.includes("running") && findings.length === 0) {
     findings.push({
       pattern: "VM running but guest OS unresponsive",
       detail: "VM is powered on but the VM agent is not reporting. The guest OS may not have booted successfully.",
-      suggestedAction: "Check the serial console log for boot errors. If no log is available, enable boot diagnostics and restart the VM.",
+      suggestedAction: log
+        ? "The serial console log was retrieved but no known error pattern was matched. Review the raw log for clues."
+        : "Enable boot diagnostics to capture the serial console log (az vm boot-diagnostics enable), then restart the VM.",
     });
   }
 
