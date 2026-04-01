@@ -400,7 +400,9 @@ export function registerInvestigate(server: McpServer): void {
         }
       }
 
-      // ── 8. Log Analytics — errors, exceptions, dependency failures ───
+      // ── 8. Log Analytics — scoped to THIS resource ─────────────────────
+      // Queries filter by _ResourceId or AppRoleName to avoid pulling
+      // unrelated data from other resources sharing the same workspace.
       interface LogData {
         workspace: string;
         failedRequests: Array<{ operation: string; statusCode: string; count: number; avgDurationMs: number }>;
@@ -408,6 +410,9 @@ export function registerInvestigate(server: McpServer): void {
         dependencyFailures: Array<{ target: string; type: string; resultCode: string; count: number; avgDurationMs: number }>;
       }
       let logData: LogData | null = null;
+
+      // Build a resource filter for Log Analytics queries
+      const resourceFilter = `| where _ResourceId has '${resourceName}' or AppRoleName has '${resourceName}'`;
 
       if (resolvedRG) {
         const wsResult = await discoverWorkspaces(subscription, resolvedRG);
@@ -417,17 +422,20 @@ export function registerInvestigate(server: McpServer): void {
           const [reqResult, excResult, depFail] = await Promise.all([
             queryLogAnalytics(ws.workspaceId, `AppRequests
 | where TimeGenerated > ago(${effectiveHours}h)
+${resourceFilter}
 | where Success == false
 | summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by OperationName, ResultCode
 | order by Count desc
 | take 10`, effectiveHours),
             queryLogAnalytics(ws.workspaceId, `AppExceptions
 | where TimeGenerated > ago(${effectiveHours}h)
+${resourceFilter}
 | summarize Count = count() by ExceptionType, OuterMessage
 | order by Count desc
 | take 10`, effectiveHours),
             queryLogAnalytics(ws.workspaceId, `AppDependencies
 | where TimeGenerated > ago(${effectiveHours}h)
+${resourceFilter}
 | where Success == false
 | summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by Target, DependencyType = Type, ResultCode
 | order by Count desc

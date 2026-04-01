@@ -56332,6 +56332,7 @@ function registerInvestigate(server2) {
         }
       }
       let logData = null;
+      const resourceFilter = `| where _ResourceId has '${resourceName}' or AppRoleName has '${resourceName}'`;
       if (resolvedRG) {
         const wsResult = await discoverWorkspaces(subscription, resolvedRG);
         if (wsResult.workspaces.length > 0) {
@@ -56339,17 +56340,20 @@ function registerInvestigate(server2) {
           const [reqResult, excResult, depFail] = await Promise.all([
             queryLogAnalytics(ws.workspaceId, `AppRequests
 | where TimeGenerated > ago(${effectiveHours}h)
+${resourceFilter}
 | where Success == false
 | summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by OperationName, ResultCode
 | order by Count desc
 | take 10`, effectiveHours),
             queryLogAnalytics(ws.workspaceId, `AppExceptions
 | where TimeGenerated > ago(${effectiveHours}h)
+${resourceFilter}
 | summarize Count = count() by ExceptionType, OuterMessage
 | order by Count desc
 | take 10`, effectiveHours),
             queryLogAnalytics(ws.workspaceId, `AppDependencies
 | where TimeGenerated > ago(${effectiveHours}h)
+${resourceFilter}
 | where Success == false
 | summarize Count = count(), AvgDuration = round(avg(DurationMs), 1) by Target, DependencyType = Type, ResultCode
 | order by Count desc
