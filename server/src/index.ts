@@ -4,20 +4,18 @@ import { registerHealthcheck } from "./tools/healthcheck.js";
 import { registerInvestigate } from "./tools/investigate.js";
 import { registerBaseline } from "./tools/baseline.js";
 import { registerCompare } from "./tools/compare.js";
-import { registerRemediate } from "./tools/remediate.js";
 import { registerAlertRules } from "./tools/alertRules.js";
 import { registerRbacAudit } from "./tools/rbacAudit.js";
 
 const server = new McpServer({
   name: "azdoctor",
-  version: "0.3.0",
+  version: "0.4.0",
 });
 
 registerHealthcheck(server);
 registerInvestigate(server);
 registerBaseline(server);
 registerCompare(server);
-registerRemediate(server);
 registerAlertRules(server);
 registerRbacAudit(server);
 
