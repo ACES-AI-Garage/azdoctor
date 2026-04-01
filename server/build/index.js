@@ -56328,7 +56328,7 @@ function registerInvestigate(server2) {
             }),
             5
           );
-          dependencies.push(...healthChecks);
+          dependencies.push(...healthChecks.filter((d) => d.health !== "Unknown"));
         }
       }
       let logData = null;

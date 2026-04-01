@@ -396,7 +396,9 @@ export function registerInvestigate(server: McpServer): void {
             }),
             5
           );
-          dependencies.push(...healthChecks);
+          // Filter out resources that always report "Unknown" health (e.g., SQL Server
+          // parent resources — only the database child supports Resource Health)
+          dependencies.push(...healthChecks.filter((d) => d.health !== "Unknown"));
         }
       }
 
