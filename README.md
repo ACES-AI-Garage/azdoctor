@@ -87,8 +87,8 @@ Check the health of my production resource group
 Investigate my-app-service in resource group prod-rg
 Is the CPU usage on my-app-service normal right now?
 Compare prod-rg vs staging-rg
-Restart my-app-service to mitigate the issue
 Generate alert rules for my-app-service based on the investigation
+Audit RBAC role assignments on my subscription
 ```
 
 For incident RCAs, scope the investigation to a time window:
@@ -105,8 +105,8 @@ Investigate my-app-service with start time 2026-03-25T14:00:00Z and end time 202
 | `azdoctor_healthcheck` | Subscription or resource group scan combining Resource Health, Azure Advisor cost findings, and Activity Log anomalies into a risk-scored assessment. |
 | `azdoctor_baseline` | Compares current metrics against a 7-day rolling average using z-scores. Answers "is this normal?" with statistical confidence. |
 | `azdoctor_compare` | Diffs two environments across resource inventory, health status, and change velocity. Surfaces parity issues and infrastructure drift. |
-| `azdoctor_remediate` | Safe operational actions (restart, scale, failover) with dry-run mode by default. Shows risk ratings and expected impact before execution. |
 | `azdoctor_alert_rules` | Generates Azure Monitor alert rules using dynamically discovered metrics, with thresholds tailored from investigation data. Outputs deployable Bicep templates. |
+| `azdoctor_rbac_audit` | Audits RBAC role assignments and custom roles. Detects orphaned assignments, approaching limits, authorization failures, and recommends correct roles. |
 
 All tools auto-detect your subscription from `az CLI`.
 
