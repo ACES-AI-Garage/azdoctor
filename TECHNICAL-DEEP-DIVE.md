@@ -79,16 +79,7 @@ AZ Doctor is an MCP (Model Context Protocol) server that gives AI assistants —
 
 **Compares:** resource inventory by type, health status, change velocity (activity log events in last 24h). Reports parity as matched/partial/divergent.
 
-### 5. `azdoctor_remediate`
-
-**File:** `server/src/tools/remediate.ts`
-**Purpose:** Execute safe operational actions with dry-run by default.
-
-**Supported actions:** restart (App Service, Redis), scale_up (App Service Plan, SQL, Redis), scale_out (App Service Plan), failover (SQL, Cosmos DB), flush_cache (Redis).
-
-**Safety:** `dryRun: true` by default. Shows risk rating (low/medium/high), expected impact, and rollback hints before execution. The AI model must explicitly set `dryRun: false` after user confirmation.
-
-### 6. `azdoctor_alert_rules`
+### 5. `azdoctor_alert_rules`
 
 **File:** `server/src/tools/alertRules.ts`
 **Purpose:** Generate monitoring rules with deployable Bicep templates.
@@ -98,6 +89,21 @@ AZ Doctor is an MCP (Model Context Protocol) server that gives AI assistants —
 2. Matches against alertable patterns (error rates, CPU, memory, latency, etc.)
 3. If `investigationContext` is provided (JSON from a prior investigate call), tailors thresholds based on observed values
 4. Generates Bicep template with the actual metric names and appropriate thresholds
+
+### 6. `azdoctor_rbac_audit`
+
+**File:** `server/src/tools/rbacAudit.ts`
+**Purpose:** Audit RBAC role assignments, custom roles, and authorization failures.
+
+**What it checks:**
+- Role assignment count vs 4000 subscription limit
+- Custom role definition count vs 5000 limit
+- Orphaned role assignments (deleted principals)
+- Redundant assignments (same role at multiple scopes)
+- Recent authorization failures from activity log (AuthorizationFailed, RoleAssignmentLimitExceeded, etc.)
+- Recommends correct roles for failed operations
+
+**Also enriches investigate:** When the investigate tool processes activity log events, it detects RBAC authorization failures and includes the error code and recommended role in the output.
 
 ## Key Technical Concepts
 
@@ -181,7 +187,7 @@ azdoctor/
 │       │   ├── healthcheck.ts      # Subscription/RG health scan
 │       │   ├── baseline.ts         # Z-score anomaly detection
 │       │   ├── compare.ts          # Environment diffing
-│       │   ├── remediate.ts        # Safe operational actions
+│       │   ├── rbacAudit.ts        # RBAC role assignment auditing
 │       │   └── alertRules.ts       # Dynamic alert generation
 │       └── utils/
 │           ├── azure-client.ts     # Azure SDK wrappers (lazy-loaded)
