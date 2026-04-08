@@ -9,3 +9,4 @@ server/build/*.d.ts
 HANDOFF.md
 demo/
 .github/
+AZDOCTOR-VS-SRE-AGENT.md
